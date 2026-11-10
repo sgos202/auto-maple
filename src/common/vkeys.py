@@ -7,6 +7,7 @@ import win32api
 from src.common import utils
 from ctypes import wintypes
 from random import random
+import threading
 
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -111,6 +112,46 @@ KEY_MAP = {
     "'": 0xDE
 }
 
+HORIZONTAL_MOVEMENT_KEYS = {
+    'left': 'left',
+    'right': 'right'
+}
+_INPUT_STATE_LOCK = threading.Lock()
+_ACTIVE_INPUT_KEYS = set()
+_LAST_INPUT_EVENT = 'No simulated key events yet.'
+
+
+def input_status():
+    """Returns keys currently held by Auto Maple and its most recent key event."""
+
+    with _INPUT_STATE_LOCK:
+        return tuple(sorted(_ACTIVE_INPUT_KEYS)), _LAST_INPUT_EVENT
+
+
+def _record_input_event(key, action, semantic_key=None):
+    global _LAST_INPUT_EVENT
+    with _INPUT_STATE_LOCK:
+        if action == 'DOWN':
+            _ACTIVE_INPUT_KEYS.add(key)
+        else:
+            _ACTIVE_INPUT_KEYS.discard(key)
+        detail = f' (routine direction {semantic_key})' if semantic_key else ''
+        _LAST_INPUT_EVENT = f'{action} {key.upper()}{detail}'
+    print(
+        f'[KEY] {action} {key.upper()}{detail} via SendInput; '
+        'game receipt is not verified.'
+    )
+
+
+def set_horizontal_movement_keys(left, right):
+    """Maps routine left/right movement directions to configured game keys."""
+
+    left = left.lower()
+    right = right.lower()
+    if left not in KEY_MAP or right not in KEY_MAP or left == right:
+        raise ValueError('Horizontal movement keys must be distinct supported keys.')
+    HORIZONTAL_MOVEMENT_KEYS.update({'left': left, 'right': right})
+
 
 #################################
 #     C Struct Definitions      #
@@ -174,6 +215,21 @@ user32.SendInput.argtypes = (wintypes.UINT, LPINPUT, ctypes.c_int)
 #################################
 #           Functions           #
 #################################
+def _send_key_down(key):
+    key = key.lower()
+    mapped_key = HORIZONTAL_MOVEMENT_KEYS.get(key, key)
+    if mapped_key not in KEY_MAP:
+        print(f"Invalid keyboard input: '{key}'.")
+    else:
+        x = Input(type=INPUT_KEYBOARD, ki=KeyboardInput(wVk=KEY_MAP[mapped_key]))
+        user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
+        _record_input_event(
+            mapped_key,
+            'DOWN',
+            key if mapped_key != key else None
+        )
+
+
 @utils.run_if_enabled
 def key_down(key):
     """
@@ -182,12 +238,7 @@ def key_down(key):
     :return:        None
     """
 
-    key = key.lower()
-    if key not in KEY_MAP.keys():
-        print(f"Invalid keyboard input: '{key}'.")
-    else:
-        x = Input(type=INPUT_KEYBOARD, ki=KeyboardInput(wVk=KEY_MAP[key]))
-        user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
+    _send_key_down(key)
 
 
 def key_up(key):
@@ -199,26 +250,37 @@ def key_up(key):
     """
 
     key = key.lower()
-    if key not in KEY_MAP.keys():
+    mapped_key = HORIZONTAL_MOVEMENT_KEYS.get(key, key)
+    if mapped_key not in KEY_MAP:
         print(f"Invalid keyboard input: '{key}'.")
     else:
-        x = Input(type=INPUT_KEYBOARD, ki=KeyboardInput(wVk=KEY_MAP[key], dwFlags=KEYEVENTF_KEYUP))
+        x = Input(type=INPUT_KEYBOARD,
+                  ki=KeyboardInput(wVk=KEY_MAP[mapped_key], dwFlags=KEYEVENTF_KEYUP))
         user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
+        _record_input_event(
+            mapped_key,
+            'UP',
+            key if mapped_key != key else None
+        )
 
 
 @utils.run_if_enabled
-def press(key, n, down_time=0.05, up_time=0.1):
+def press(key, n, down_time=0.05, up_time=0.1, allow_paused=False):
     """
     Presses KEY N times, holding it for DOWN_TIME seconds, and releasing for UP_TIME seconds.
     :param key:         The keyboard input to press.
     :param n:           Number of times to press KEY.
     :param down_time:   Duration of down-press (in seconds).
     :param up_time:     Duration of release (in seconds).
+    :param allow_paused:    Whether this explicit key press may run while paused.
     :return:            None
     """
 
     for _ in range(n):
-        key_down(key)
+        if allow_paused:
+            _send_key_down(key)
+        else:
+            key_down(key)
         time.sleep(down_time * (0.8 + 0.4 * random()))
         key_up(key)
         time.sleep(up_time * (0.8 + 0.4 * random()))

@@ -1,9 +1,15 @@
 """A module for classifying directional arrows using TensorFlow."""
 
+from pathlib import Path
+
 import cv2
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
+
 from src.common import utils
+
+
+MODEL_DIR = Path('assets/models/rune_model_rnn_filtered_cannied/saved_model')
 
 
 #########################
@@ -15,8 +21,18 @@ def load_model():
     :return:    The Tensorflow model object.
     """
 
-    model_dir = f'assets/models/rune_model_rnn_filtered_cannied/saved_model'
-    return tf.saved_model.load(model_dir)
+    required_files = (
+        MODEL_DIR / 'saved_model.pb',
+        MODEL_DIR / 'variables' / 'variables.index',
+        MODEL_DIR / 'variables' / 'variables.data-00000-of-00001',
+    )
+    missing_files = [str(path) for path in required_files if not path.is_file()]
+    if missing_files:
+        raise FileNotFoundError(
+            'SavedModel is incomplete; missing required file(s): '
+            + ', '.join(missing_files)
+        )
+    return tf.saved_model.load(str(MODEL_DIR))
 
 
 def canny(image):

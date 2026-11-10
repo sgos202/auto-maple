@@ -1,6 +1,10 @@
 """The central program that ties all the modules together."""
 
 import time
+from src.common.output import output_capture
+
+output_capture.install()
+
 from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.notifier import Notifier

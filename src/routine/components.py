@@ -4,6 +4,7 @@ import math
 import time
 from src.common import config, settings, utils
 from src.common.vkeys import key_down, key_up, press
+from src.routine.layout import Layout
 
 
 #################################
@@ -78,12 +79,16 @@ class Point(Component):
         """Executes the set of actions associated with this Point."""
 
         if self.counter == 0:
+            print(
+                f'\n[~] Point {self.location}: moving from {config.player_pos}.'
+            )
             move = config.bot.command_book['move']
             move(*self.location).execute()
             if self.adjust:
                 adjust = config.bot.command_book['adjust']      # TODO: adjust using step('up')?
                 adjust(*self.location).execute()
             for command in self.commands:
+                print(f'[~] Point {self.location}: executing {command.id}.')
                 command.execute()
         self._increment_counter()
 
@@ -236,14 +241,31 @@ class Move(Command):
         self.prev_direction = ''
 
     def _new_direction(self, new):
-        key_down(new)
-        if self.prev_direction and self.prev_direction != new:
+        if self.prev_direction == new:
+            return
+        if self.prev_direction:
             key_up(self.prev_direction)
+        key_down(new)
         self.prev_direction = new
 
     def main(self):
         counter = self.max_steps
-        path = config.layout.shortest_path(config.player_pos, self.target)
+        layout = config.layout
+        if layout is None and config.routine.path:
+            layout = Layout.load(config.routine.path)
+            config.layout = layout
+        if layout is None:
+            print(
+                '\n[!] Map layout is unavailable; moving directly toward the target '
+                'without learned platform routing.'
+            )
+            path = [config.player_pos, self.target]
+        else:
+            path = layout.shortest_path(config.player_pos, self.target)
+        print(
+            f'[~] Move target {self.target}; current position {config.player_pos}; '
+            f'path has {len(path)} point(s).'
+        )
         for i, point in enumerate(path):
             toggle = True
             self.prev_direction = ''
@@ -259,9 +281,13 @@ class Move(Command):
                             key = 'left'
                         else:
                             key = 'right'
+                        print(f'[~] Moving {key} toward {point}.')
                         self._new_direction(key)
                         step(key, point)
-                        if settings.record_layout:
+                        config.bot._service_loot_pickup()
+                        if config.bot._service_mob_attack(self.prev_direction):
+                            self.prev_direction = ''
+                        if settings.record_layout and config.layout is not None:
                             config.layout.add(*config.player_pos)
                         counter -= 1
                         if i < len(path) - 1:
@@ -273,9 +299,13 @@ class Move(Command):
                             key = 'up'
                         else:
                             key = 'down'
+                        print(f'[~] Moving {key} toward {point}.')
                         self._new_direction(key)
                         step(key, point)
-                        if settings.record_layout:
+                        config.bot._service_loot_pickup()
+                        if config.bot._service_mob_attack(self.prev_direction):
+                            self.prev_direction = ''
+                        if settings.record_layout and config.layout is not None:
                             config.layout.add(*config.player_pos)
                         counter -= 1
                         if i < len(path) - 1:

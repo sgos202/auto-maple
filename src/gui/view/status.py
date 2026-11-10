@@ -1,5 +1,8 @@
 import tkinter as tk
 from src.gui.interfaces import LabelFrame
+from src.gui.view.health import HealthPotion
+from src.gui.view.loot import LootPickup
+from src.gui.view.mob import MobTracker
 
 
 class Status(LabelFrame):
@@ -21,6 +24,21 @@ class Status(LabelFrame):
         self.r_label.grid(row=1, column=1, padx=5, pady=(0, 5), sticky=tk.E)
         self.r_entry = tk.Entry(self, textvariable=self.curr_routine, state=tk.DISABLED)
         self.r_entry.grid(row=1, column=2, padx=(0, 5), pady=(0, 5), sticky=tk.EW)
+
+        self.health_potion = HealthPotion(self)
+        self.health_potion.grid(
+            row=2, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(0, 5)
+        )
+
+        self.mob_tracker = MobTracker(self)
+        self.mob_tracker.grid(
+            row=3, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(0, 5)
+        )
+
+        self.loot_pickup = LootPickup(self)
+        self.loot_pickup.grid(
+            row=4, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(0, 5)
+        )
 
     def set_cb(self, string):
         self.curr_cb.set(string)

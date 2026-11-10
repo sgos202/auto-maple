@@ -2,9 +2,7 @@
 
 from src.common import config, utils
 import time
-import os
 import cv2
-import pygame
 import threading
 import numpy as np
 import keyboard as kb
@@ -29,18 +27,9 @@ OTHER_TEMPLATE = cv2.cvtColor(other_filtered, cv2.COLOR_BGR2GRAY)
 ELITE_TEMPLATE = cv2.imread('assets/elite_template.jpg', 0)
 
 
-def get_alert_path(name):
-    return os.path.join(Notifier.ALERTS_DIR, f'{name}.mp3')
-
-
 class Notifier:
-    ALERTS_DIR = os.path.join('assets', 'alerts')
-
     def __init__(self):
         """Initializes this Notifier object's main thread."""
-
-        pygame.mixer.init()
-        self.mixer = pygame.mixer.music
 
         self.ready = False
         self.thread = threading.Thread(target=self._main)
@@ -68,13 +57,13 @@ class Notifier:
                 # Check for unexpected black screen
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 if np.count_nonzero(gray < 15) / height / width > self.room_change_threshold:
-                    self._alert('siren')
+                    self._alert()
 
                 # Check for elite warning
                 elite_frame = frame[height // 4:3 * height // 4, width // 4:3 * width // 4]
                 elite = utils.multi_match(elite_frame, ELITE_TEMPLATE, threshold=0.9)
                 if len(elite) > 0:
-                    self._alert('siren')
+                    self._alert()
 
                 # Check for other players entering the map
                 filtered = utils.filter_color(minimap, OTHER_RANGES)
@@ -98,35 +87,36 @@ class Notifier:
                         index = np.argmin(distances)
                         config.bot.rune_closest_pos = config.routine[index].location
                         config.bot.rune_active = True
-                        self._ping('rune_appeared', volume=0.75)
+                        self._ping('rune_appeared')
                 elif now - rune_start_time > self.rune_alert_delay:     # Alert if rune hasn't been solved
                     config.bot.rune_active = False
-                    self._alert('siren')
+                    self._alert()
             time.sleep(0.05)
 
-    def _alert(self, name, volume=0.75):
+    def _alert(self):
         """
-        Plays an alert to notify user of a dangerous event. Stops the alert
-        once the key bound to 'Start/stop' is pressed.
+        Pauses Auto Maple for a dangerous event until the user acknowledges it.
         """
 
         config.enabled = False
         config.listener.enabled = False
-        self.mixer.load(get_alert_path(name))
-        self.mixer.set_volume(volume)
-        self.mixer.play(-1)
+        print(
+            '\n[!] Safety alert detected; Auto Maple is paused. '
+            'Press the Start/stop key to dismiss the alert.'
+        )
         while not kb.is_pressed(config.listener.config['Start/stop']):
             time.sleep(0.1)
-        self.mixer.stop()
         time.sleep(2)
         config.listener.enabled = True
 
-    def _ping(self, name, volume=0.5):
-        """A quick notification for non-dangerous events."""
+    def _ping(self, name):
+        """Reports a non-dangerous event without playing a sound."""
 
-        self.mixer.load(get_alert_path(name))
-        self.mixer.set_volume(volume)
-        self.mixer.play()
+        message = {
+            'ding': 'Another player entered the map.',
+            'rune_appeared': 'A rune was detected.'
+        }.get(name, f'Notification: {name}.')
+        print(f'\n[~] {message}')
 
 
 #################################

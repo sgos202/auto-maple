@@ -4,6 +4,7 @@ import importlib
 import traceback
 from os.path import basename, splitext
 from src.common import config, utils
+from src.common import vkeys
 from src.routine import components
 from src.common.interfaces import Configurable
 
@@ -97,6 +98,10 @@ class CommandBook(Configurable):
                   f"or the function 'step'")
         if required_found and (step_found or movement_found):
             self.buff = new_cb['buff']()
+            vkeys.set_horizontal_movement_keys(
+                getattr(module.Key, 'LEFT', 'left'),
+                getattr(module.Key, 'RIGHT', 'right')
+            )
             components.step = new_step
             config.gui.menu.file.enable_routine_state()
             config.gui.view.status.set_cb(basename(file))

@@ -12,12 +12,13 @@ from random import random
 def run_if_enabled(function):
     """
     Decorator for functions that should only run if the bot is enabled.
+    Functions may opt in to an explicit ``allow_paused=True`` call.
     :param function:    The function to decorate.
     :return:            The decorated function.
     """
 
     def helper(*args, **kwargs):
-        if config.enabled:
+        if config.enabled or kwargs.get('allow_paused', False):
             return function(*args, **kwargs)
     return helper
 
@@ -74,18 +75,52 @@ def separate_args(arguments):
 
 def single_match(frame, template):
     """
-    Finds the best match within FRAME.
+    Finds the best normalized template match within FRAME.
     :param frame:       The image in which to search for TEMPLATE.
     :param template:    The template to match with.
-    :return:            The top-left and bottom-right positions of the best match.
+    :return:            The top-left and bottom-right positions and match score.
     """
 
+    if template.shape[0] > frame.shape[0] or template.shape[1] > frame.shape[1]:
+        raise ValueError('Template is larger than the frame.')
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF)
-    _, _, _, top_left = cv2.minMaxLoc(result)
+    result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, top_left = cv2.minMaxLoc(result)
     w, h = template.shape[::-1]
     bottom_right = (top_left[0] + w, top_left[1] + h)
-    return top_left, bottom_right
+    return top_left, bottom_right, score
+
+
+def multi_scale_match(frame, template, scales):
+    """
+    Finds the best normalized template match across the given template scales.
+    :return: The top-left and bottom-right positions, score, and selected scale.
+    """
+
+    best_match = None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    for scale in scales:
+        width = max(1, round(template.shape[1] * scale))
+        height = max(1, round(template.shape[0] * scale))
+        if scale == 1:
+            scaled_template = template
+        else:
+            interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            scaled_template = cv2.resize(template, (width, height),
+                                         interpolation=interpolation)
+        if height > frame.shape[0] or width > frame.shape[1]:
+            continue
+
+        result = cv2.matchTemplate(gray, scaled_template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, top_left = cv2.minMaxLoc(result)
+        if best_match is None or score > best_match[2]:
+            bottom_right = (top_left[0] + width, top_left[1] + height)
+            best_match = (top_left, bottom_right, score, scale)
+
+    if best_match is None:
+        raise ValueError('Template does not fit within the frame at any scale.')
+    return best_match
 
 
 def multi_match(frame, template, threshold=0.95):

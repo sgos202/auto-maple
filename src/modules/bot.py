@@ -14,8 +14,9 @@ from src.routine import components
 from src.routine.routine import Routine
 from src.command_book.command_book import CommandBook
 from src.routine.components import Point
-from src.common.vkeys import press, click
+from src.common.vkeys import press, click, key_down, key_up
 from src.common.interfaces import Configurable
+from src.modules.health import is_game_focused
 
 
 # The rune's buff icon
@@ -25,6 +26,7 @@ RUNE_BUFF_TEMPLATE = cv2.imread('assets/rune_buff_template.jpg', 0)
 class Bot(Configurable):
     """A class that interprets and executes user-defined routines."""
 
+    PATROL_TURN_INTERVAL = 2.5
     DEFAULT_CONFIG = {
         'Interact': 'y',
         'Feed pet': '9'
@@ -52,6 +54,9 @@ class Bot(Configurable):
         config.routine = Routine()
 
         self.ready = False
+        self._auto_attack_movement = None
+        self._patrol_direction = None
+        self._patrol_until = 0
         self.thread = threading.Thread(target=self._main)
         self.thread.daemon = True
 
@@ -72,14 +77,22 @@ class Bot(Configurable):
         """
 
         print('\n[~] Initializing detection algorithm:\n')
-        model = detection.load_model()
-        print('\n[~] Initialized detection algorithm')
+        try:
+            model = detection.load_model()
+        except FileNotFoundError as error:
+            model = None
+            print(f'[!] Rune solver disabled: {error}')
+            print('[!] The routine will pause when a rune is detected.')
+        else:
+            print('\n[~] Initialized detection algorithm')
 
         self.ready = True
         config.listener.enabled = True
         last_fed = time.time()
         while True:
-            if config.enabled and len(config.routine) > 0:
+            if config.enabled and len(config.routine) == 0:
+                self._run_standalone_mob_attack()
+            elif config.enabled and len(config.routine) > 0:
                 # Buff and feed pets
                 self.command_book.buff.main()
                 pet_settings = config.gui.settings.pets
@@ -90,6 +103,10 @@ class Bot(Configurable):
                     press(self.config['Feed pet'], 1)
                     last_fed = now
 
+                self._service_loot_pickup()
+                if self._service_mob_attack():
+                    continue
+
                 # Highlight the current Point
                 config.gui.view.routine.select(config.routine.index)
                 config.gui.view.details.display_info(config.routine.index)
@@ -98,11 +115,114 @@ class Bot(Configurable):
                 element = config.routine[config.routine.index]
                 if self.rune_active and isinstance(element, Point) \
                         and element.location == self.rune_closest_pos:
+                    if model is None:
+                        config.enabled = False
+                        print(
+                            '\n[!] Rune detected. Handle it manually, then '
+                            'resume the routine with the Start/stop key.'
+                        )
+                        continue
                     self._solve_rune(model)
                 element.execute()
                 config.routine.step()
             else:
+                self._set_auto_attack_movement(None)
                 time.sleep(0.01)
+
+    def _run_standalone_mob_attack(self):
+        tracker = config.capture.mob_tracker
+        if not tracker.settings()['Enabled']:
+            self._set_auto_attack_movement(None)
+            time.sleep(0.05)
+            return
+        if not is_game_focused():
+            self._set_auto_attack_movement(None)
+            time.sleep(0.05)
+            return
+
+        self._service_loot_pickup()
+        target = tracker.target()
+        if target is not None:
+            offset_x, attackable = target
+            if attackable:
+                self._set_auto_attack_movement(None)
+                self._service_mob_attack()
+            else:
+                self._set_auto_attack_movement(
+                    'left' if offset_x < 0 else 'right'
+                )
+        else:
+            self._service_mob_attack()
+            self._patrol_for_mob()
+        time.sleep(0.02)
+
+    def _patrol_for_mob(self):
+        now = time.monotonic()
+        if self._patrol_direction is None:
+            direction = 'right'
+        elif now >= self._patrol_until:
+            direction = (
+                'left' if self._patrol_direction == 'right'
+                else 'right'
+            )
+        else:
+            direction = self._patrol_direction
+
+        if direction != self._patrol_direction:
+            self._patrol_until = now + self.PATROL_TURN_INTERVAL
+        self._patrol_direction = direction
+        self._set_auto_attack_movement(direction)
+
+    def _set_auto_attack_movement(self, direction):
+        if direction == self._auto_attack_movement:
+            return
+        if self._auto_attack_movement is not None:
+            key_up(self._auto_attack_movement)
+        self._auto_attack_movement = direction
+        if direction is not None and config.enabled:
+            key_down(direction)
+
+    def _service_loot_pickup(self):
+        key = config.capture.loot_tracker.consume_pickup()
+        if key is None:
+            return False
+        if not is_game_focused():
+            print('\n[!] Loot detected, but MapleStory is not focused; pickup cancelled.')
+            return False
+        print(
+            f'\n[~] Loot is under the player; sending six quick '
+            f'{key.upper()} pickup taps.'
+        )
+        press(key, 6, down_time=0.04, up_time=0.05)
+        return True
+
+    def _service_mob_attack(self, movement_direction=None):
+        direction = config.capture.mob_tracker.consume_attack()
+        if direction is None:
+            return False
+        if (self.command_book is None
+                or 'cruelstab' not in self.command_book.dict):
+            print(
+                '\n[!] Nearby enemy detected, but the loaded command book '
+                'does not provide CruelStab.'
+            )
+            return False
+
+        if not is_game_focused():
+            print('\n[!] Enemy detected, but MapleStory is not focused; attack cancelled.')
+            return False
+
+        if movement_direction:
+            key_up(movement_direction)
+        print(
+            f'\n[~] Nearby enemy detected on the {direction}; executing CruelStab.'
+        )
+        self.command_book['cruelstab'](
+            direction,
+            attacks=2,
+            repetitions=1
+        ).execute()
+        return True
 
     @utils.run_if_enabled
     def _solve_rune(self, model):
