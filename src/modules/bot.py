@@ -197,11 +197,14 @@ class Bot(Configurable):
         return True
 
     def _service_mob_attack(self, movement_direction=None):
-        direction = config.capture.mob_tracker.consume_attack()
+        direction, group_attack, group_count = (
+            config.capture.mob_tracker.consume_attack_action()
+        )
         if direction is None:
             return False
-        if (self.command_book is None
-                or 'cruelstab' not in self.command_book.dict):
+        if (not group_attack and (
+                self.command_book is None
+                or 'cruelstab' not in self.command_book.dict)):
             print(
                 '\n[!] Nearby enemy detected, but the loaded command book '
                 'does not provide CruelStab.'
@@ -214,14 +217,26 @@ class Bot(Configurable):
 
         if movement_direction:
             key_up(movement_direction)
-        print(
-            f'\n[~] Nearby enemy detected on the {direction}; executing CruelStab.'
-        )
-        self.command_book['cruelstab'](
-            direction,
-            attacks=2,
-            repetitions=1
-        ).execute()
+        if group_attack:
+            print(
+                f'\n[~] Group of {group_count} nearby enemies detected on the '
+                f'{direction}; turning and using Q.'
+            )
+            try:
+                key_down(direction)
+                time.sleep(0.06)
+            finally:
+                key_up(direction)
+            press('q', 1, down_time=0.08, up_time=0.1)
+        else:
+            print(
+                f'\n[~] Nearby enemy detected on the {direction}; executing CruelStab.'
+            )
+            self.command_book['cruelstab'](
+                direction,
+                attacks=2,
+                repetitions=1
+            ).execute()
         return True
 
     @utils.run_if_enabled

@@ -248,6 +248,56 @@ class Move(Command):
         key_down(new)
         self.prev_direction = new
 
+    def _pursue_target(self):
+        tracker = config.capture.mob_tracker
+        if not tracker.settings()['Enabled']:
+            return False
+
+        target = tracker.pursuit_target()
+        if (target is None
+                or abs(target[2]) > tracker.SEARCH_VERTICAL_TOLERANCE):
+            return False
+
+        if self.prev_direction:
+            key_up(self.prev_direction)
+            self.prev_direction = ''
+        print('\n[~] Pausing routine patrol to approach a same-level enemy.')
+        held_direction = None
+        try:
+            while config.enabled:
+                target = tracker.pursuit_target()
+                if (target is None
+                        or abs(target[2]) > tracker.SEARCH_VERTICAL_TOLERANCE):
+                    break
+
+                offset_x, attackable, _ = target
+                if attackable:
+                    if held_direction is not None:
+                        key_up(held_direction)
+                        held_direction = None
+                        self.prev_direction = ''
+                else:
+                    direction = 'left' if offset_x < 0 else 'right'
+                    if direction != held_direction:
+                        if held_direction is not None:
+                            key_up(held_direction)
+                        key_down(direction)
+                        held_direction = direction
+                        self.prev_direction = direction
+
+                config.bot._service_loot_pickup()
+                if config.bot._service_mob_attack(held_direction):
+                    held_direction = None
+                    self.prev_direction = ''
+                time.sleep(0.02)
+        finally:
+            if held_direction is not None:
+                key_up(held_direction)
+            self.prev_direction = ''
+
+        print('\n[~] Enemy no longer detected; resuming routine patrol.')
+        return True
+
     def main(self):
         counter = self.max_steps
         layout = config.layout
@@ -274,6 +324,10 @@ class Move(Command):
             while config.enabled and counter > 0 and \
                     local_error > settings.move_tolerance and \
                     global_error > settings.move_tolerance:
+                if self._pursue_target():
+                    local_error = utils.distance(config.player_pos, point)
+                    global_error = utils.distance(config.player_pos, self.target)
+                    continue
                 if toggle:
                     d_x = point[0] - config.player_pos[0]
                     if abs(d_x) > settings.move_tolerance / math.sqrt(2):

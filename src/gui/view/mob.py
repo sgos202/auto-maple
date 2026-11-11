@@ -51,7 +51,7 @@ class MobTracker(ttk.LabelFrame):
         self.distance_box.grid(row=2, column=1, sticky=tk.W, pady=(5, 0))
         self.distance_box.bind('<FocusOut>', self._apply_settings)
         self.distance_box.bind('<Return>', self._apply_settings)
-        ttk.Label(self, text='px   2 hits / 0.4 sec; range 45 px').grid(
+        ttk.Label(self, text='px   2 hits / 0.4 sec; 3+ group: Q').grid(
             row=2, column=2, columnspan=2, sticky=tk.W, pady=(5, 0)
         )
 

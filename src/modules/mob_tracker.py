@@ -25,19 +25,24 @@ class MobTracker(Configurable):
     MOB_TEMPLATE_PATH = os.path.join(TEMPLATE_DIRECTORY, 'mob_target.png')
     PLAYER_SEARCH_HEIGHT_RATIO = 0.88
     PLAYER_MATCH_MIN_THRESHOLD = 0.60
-    MOB_MATCH_MIN_THRESHOLD = 0.60
-    MOB_MATCH_THRESHOLD_MARGIN = 0.10
-    MOB_TEMPLATE_SCALES = (0.8, 0.9, 1.0, 1.1, 1.2)
+    MOB_MATCH_MIN_THRESHOLD = 0.52
+    MOB_MATCH_THRESHOLD_MARGIN = 0.20
+    MOB_TEMPLATE_SCALES = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
     MATCH_INTERVAL = 6
     ATTACK_COOLDOWN = 0.4
     ATTACK_RANGE = 60
     VERTICAL_TOLERANCE = 16
+    SEARCH_VERTICAL_TOLERANCE = 64
+    GROUP_ATTACK_VERTICAL_TOLERANCE = 64
     TARGET_CONFIRMATIONS = 2
     TARGET_LOST_GRACE_SECONDS = 1.5
     TARGET_LOCK_RADIUS = 32
     HP_BAR_SEARCH_HEIGHT = 42
     HP_BAR_MAX_WIDTH = 70
     HP_BAR_MAX_CENTER_OFFSET = 24
+    GROUP_MIN_ENEMIES = 3
+    GROUP_HORIZONTAL_RADIUS = 72
+    GROUP_VERTICAL_RADIUS = 64
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -47,6 +52,8 @@ class MobTracker(Configurable):
         self._target_offset_x = None
         self._target_vertical_offset = None
         self._target_attackable = False
+        self._group_count = 0
+        self._attack_is_group = False
         self._locked_target = None
         self._pending_target = None
         self._target_missed_scans = 0
@@ -83,6 +90,8 @@ class MobTracker(Configurable):
             self._target_offset_x = None
             self._target_vertical_offset = None
             self._target_attackable = False
+            self._group_count = 0
+            self._attack_is_group = False
             self._locked_target = None
             self._pending_target = None
             self._target_missed_scans = 0
@@ -139,6 +148,8 @@ class MobTracker(Configurable):
             self._target_offset_x = None
             self._target_vertical_offset = None
             self._target_attackable = False
+            self._group_count = 0
+            self._attack_is_group = False
             self._locked_target = None
             self._pending_target = None
             self._target_missed_scans = 0
@@ -299,13 +310,35 @@ class MobTracker(Configurable):
         with self._lock:
             direction = self._attack_direction
             self._attack_direction = None
+            self._attack_is_group = False
             return direction
+
+    def consume_attack_action(self):
+        with self._lock:
+            action = (
+                self._attack_direction,
+                self._attack_is_group,
+                self._group_count if self._attack_is_group else 0,
+            )
+            self._attack_direction = None
+            self._attack_is_group = False
+            return action
 
     def target(self):
         with self._lock:
             if self._target_offset_x is None:
                 return None
             return self._target_offset_x, self._target_attackable
+
+    def pursuit_target(self):
+        with self._lock:
+            if self._target_offset_x is None or self._target_vertical_offset is None:
+                return None
+            return (
+                self._target_offset_x,
+                self._target_attackable,
+                self._target_vertical_offset,
+            )
 
     def _hold_locked_target(self, player_x, enabled, bot_enabled):
         with self._lock:
@@ -354,7 +387,7 @@ class MobTracker(Configurable):
     def _matching_locations(search, template, threshold):
         if (search.size == 0 or template.shape[0] > search.shape[0]
                 or template.shape[1] > search.shape[1]):
-            return []
+            return [], 0.0
         if template.ndim == 3:
             channel_results = [
                 cv2.matchTemplate(
@@ -367,6 +400,7 @@ class MobTracker(Configurable):
             result = np.mean(channel_results, axis=0, dtype=np.float32)
         else:
             result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+        best_score = float(np.max(result))
         maxima = cv2.dilate(
             result,
             np.ones(template.shape[:2], dtype=np.uint8)
@@ -385,7 +419,7 @@ class MobTracker(Configurable):
             ):
                 continue
             matches.append(((x, y), float(result[y, x])))
-        return matches
+        return matches, best_score
 
     @staticmethod
     def _best_match(search, template):
@@ -395,6 +429,53 @@ class MobTracker(Configurable):
         result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
         _, score, _, top_left = cv2.minMaxLoc(result)
         return top_left, score
+
+    @classmethod
+    def _nearest_enemy_group(cls, positioned_candidates, player_x):
+        enemies = []
+        for item in sorted(
+            positioned_candidates,
+            key=lambda candidate: candidate[0][0],
+            reverse=True,
+        ):
+            candidate, mob_x, mob_y, _ = item
+            template = candidate[2]
+            width, height = template.shape[1], template.shape[0]
+            duplicate = any(
+                abs(mob_x - existing[0]) < min(width, existing[2]) * 0.5
+                and abs(mob_y - existing[1]) < min(height, existing[3]) * 0.5
+                for existing in enemies
+            )
+            if not duplicate:
+                enemies.append((mob_x, mob_y, width, height, item))
+
+        groups = []
+        remaining = set(range(len(enemies)))
+        while remaining:
+            component = []
+            frontier = [remaining.pop()]
+            while frontier:
+                index = frontier.pop()
+                component.append(index)
+                x, y = enemies[index][:2]
+                neighbors = [
+                    other for other in remaining
+                    if abs(enemies[other][0] - x) <= cls.GROUP_HORIZONTAL_RADIUS
+                    and abs(enemies[other][1] - y) <= cls.GROUP_VERTICAL_RADIUS
+                ]
+                for other in neighbors:
+                    remaining.remove(other)
+                    frontier.append(other)
+            if len(component) >= cls.GROUP_MIN_ENEMIES:
+                members = [enemies[index][4] for index in component]
+                center_x = (
+                    sum(enemies[index][0] for index in component) / len(component)
+                )
+                groups.append((abs(center_x - player_x), -len(component), members))
+
+        if not groups:
+            return []
+        return min(groups, key=lambda group: (group[0], group[1]))[2]
 
     @classmethod
     def _health_bar_ratio(cls, frame, mob_bounds):
@@ -457,6 +538,8 @@ class MobTracker(Configurable):
             enabled = self.config['Enabled']
             if not enabled or not bot_enabled:
                 self._attack_direction = None
+                self._attack_is_group = False
+                self._group_count = 0
                 self._target_offset_x = None
                 self._target_vertical_offset = None
                 self._target_attackable = False
@@ -464,6 +547,9 @@ class MobTracker(Configurable):
                 return
             if self._frame_count % self.MATCH_INTERVAL:
                 return
+            self._attack_direction = None
+            self._group_count = 0
+            self._attack_is_group = False
             player_template = self._player_template
             mob_templates = self._mob_templates.copy()
             threshold = max(
@@ -493,6 +579,8 @@ class MobTracker(Configurable):
             with self._lock:
                 self._status = 'Player badge not found; make sure it is visible.'
                 self._attack_direction = None
+                self._attack_is_group = False
+                self._group_count = 0
                 self._target_offset_x = None
                 self._target_vertical_offset = None
                 self._target_attackable = False
@@ -502,11 +590,13 @@ class MobTracker(Configurable):
         player_x = player_top[0] + player_template.shape[1] // 2
         player_y = player_top[1] + player_template.shape[0] // 2
         candidates = []
+        sample_best_scores = []
         for template_index, (mob_template, alignment_y) in enumerate(mob_templates):
             mob_search = gray
             if mob_template.ndim == 3:
                 mob_search = frame[:, :, :3]
             sample_candidates = []
+            sample_best_score = 0.0
             for scale in self.MOB_TEMPLATE_SCALES:
                 if scale == 1.0:
                     scaled_template = mob_template
@@ -528,22 +618,23 @@ class MobTracker(Configurable):
                 half_height = scaled_template.shape[0] // 2
                 y1 = max(
                     0,
-                    expected_mob_y - half_height - self.VERTICAL_TOLERANCE
+                    expected_mob_y - half_height - self.SEARCH_VERTICAL_TOLERANCE
                 )
                 y2 = min(
                     gray.shape[0],
-                    expected_mob_y + half_height + self.VERTICAL_TOLERANCE
+                    expected_mob_y + half_height + self.SEARCH_VERTICAL_TOLERANCE
                 )
                 x1 = max(
                     0,
                     player_x - distance - scaled_template.shape[1]
                 )
                 x2 = min(gray.shape[1], player_x + distance)
-                mob_matches = self._matching_locations(
+                mob_matches, best_score = self._matching_locations(
                     mob_search[y1:y2, x1:x2],
                     scaled_template,
                     threshold
                 )
+                sample_best_score = max(sample_best_score, best_score)
                 sample_candidates.extend(
                     (
                         mob_score,
@@ -556,6 +647,7 @@ class MobTracker(Configurable):
                     )
                     for mob_top, mob_score in mob_matches
                 )
+            sample_best_scores.append(sample_best_score)
 
             sample_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
             for candidate in sample_candidates:
@@ -580,15 +672,23 @@ class MobTracker(Configurable):
         if not candidates:
             with self._lock:
                 self._attack_direction = None
+                self._attack_is_group = False
+                self._group_count = 0
             if self._hold_locked_target(player_x, enabled, bot_enabled):
                 return
             with self._lock:
                 self._target_offset_x = None
                 self._target_vertical_offset = None
                 self._target_attackable = False
+                self._group_count = 0
+                score_summary = ', '.join(
+                    f'{index + 1}:{score:.0%}'
+                    for index, score in enumerate(sample_best_scores)
+                )
                 self._status = (
                     f'Player found ({player_score:.0%}); no nearby enemy match '
-                    f'in {len(mob_templates)} sample(s).'
+                    f'in {len(mob_templates)} sample(s); scores '
+                    f'{score_summary}; threshold {threshold:.0%}.'
                 )
             return
 
@@ -609,7 +709,10 @@ class MobTracker(Configurable):
                 candidate, mob_x, mob_y, health_ratio
             ))
 
+        group = self._nearest_enemy_group(positioned_candidates, player_x)
+        group_count = len(group)
         with self._lock:
+            self._group_count = group_count
             locked_target = self._locked_target
         selected = None
         if locked_target is not None:
@@ -626,7 +729,8 @@ class MobTracker(Configurable):
                     + abs(item[2] - locked_y)
                 )
             else:
-                if self._hold_locked_target(player_x, enabled, bot_enabled):
+                if (not group
+                        and self._hold_locked_target(player_x, enabled, bot_enabled)):
                     return
 
         if selected is None:
@@ -642,7 +746,6 @@ class MobTracker(Configurable):
             with self._lock:
                 pending = self._pending_target
                 if (pending is not None
-                        and pending[0] == template_index
                         and abs(pending[1] - selected_x) <= self.TARGET_LOCK_RADIUS
                         and abs(pending[2] - selected_y) <= self.TARGET_LOCK_RADIUS):
                     confirmations = pending[3] + 1
@@ -655,9 +758,11 @@ class MobTracker(Configurable):
                     self._target_offset_x = None
                     self._target_attackable = False
                     self._attack_direction = None
+                    self._attack_is_group = False
                     self._status = (
-                        f'Confirming one enemy target '
-                        f'({confirmations}/{self.TARGET_CONFIRMATIONS}).'
+                        f'Confirming enemy at ({selected_x}, {selected_y}) '
+                        f'({confirmations}/{self.TARGET_CONFIRMATIONS}); '
+                        f'match {candidate[0]:.0%}.'
                     )
                     return
                 self._locked_target = (
@@ -676,6 +781,20 @@ class MobTracker(Configurable):
             abs(delta_x) <= self.ATTACK_RANGE
             and abs(delta_y) <= self.VERTICAL_TOLERANCE
         )
+        group_direction = None
+        group_in_range = False
+        if group:
+            group_center_x = sum(item[1] for item in group) / group_count
+            group_direction = 'left' if group_center_x < player_x else 'right'
+            group_in_range = any(
+                abs(item[1] - player_x) <= self.ATTACK_RANGE
+                and abs(
+                    item[2] - (
+                        player_y + item[0][3]
+                    )
+                ) <= self.GROUP_ATTACK_VERTICAL_TOLERANCE
+                for item in group
+            )
 
         with self._lock:
             self._locked_target = (template_index, mob_x, mob_y)
@@ -688,14 +807,30 @@ class MobTracker(Configurable):
                 f'{"in attack range" if attackable else "approaching"} '
                 'on calibrated level.'
             )
-            self._target_offset_x = delta_x
+            if group:
+                self._status += (
+                    f' Group of {group_count} detected; '
+                    f'{"in group-attack range" if group_in_range else "approaching group"}.'
+                )
+            self._target_offset_x = group_center_x - player_x if group else delta_x
             self._target_vertical_offset = delta_y
-            self._target_attackable = attackable
-            if not enabled or not bot_enabled or not attackable:
+            self._target_attackable = attackable or group_in_range
+            if not enabled or not bot_enabled:
                 self._attack_direction = None
+                self._attack_is_group = False
             elif not is_game_focused():
                 self._status += ' Waiting for MapleStory focus.'
                 self._attack_direction = None
+                self._attack_is_group = False
             elif time.monotonic() - self._last_attack_time >= self.ATTACK_COOLDOWN:
-                self._attack_direction = direction
-                self._last_attack_time = time.monotonic()
+                if group_in_range:
+                    self._attack_direction = group_direction
+                    self._attack_is_group = True
+                elif attackable:
+                    self._attack_direction = direction
+                    self._attack_is_group = False
+                else:
+                    self._attack_direction = None
+                    self._attack_is_group = False
+                if self._attack_direction is not None:
+                    self._last_attack_time = time.monotonic()
