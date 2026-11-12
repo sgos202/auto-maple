@@ -10,6 +10,7 @@ from src.gui.interfaces import Frame
 class LootPickup(Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
+        self.grid_columnconfigure(0, weight=1)
         self.tracker = config.capture.loot_tracker
         current = self.tracker.settings()
 
@@ -28,8 +29,8 @@ class LootPickup(Frame):
         ).grid(row=0, column=1, sticky=tk.W)
 
         self.status = tk.StringVar()
-        ttk.Label(self, textvariable=self.status, wraplength=480).grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=(3, 0)
+        ttk.Label(self, textvariable=self.status, wraplength=700).grid(
+            row=1, column=0, columnspan=2, sticky=tk.EW, pady=(3, 0)
         )
         self._refresh_status()
 

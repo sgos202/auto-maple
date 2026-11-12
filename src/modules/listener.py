@@ -107,7 +107,7 @@ class Listener(Configurable):
                         'starting standalone auto-attack.'
                     )
                     return
-            if not config.capture.calibrated and not Listener.recalibrate_minimap():
+            if not config.capture.calibrated and not Listener.wait_for_minimap():
                 return
             print('\n[~] Auto Maple starts in 3 seconds. Focus the MapleStory window now.')
             for remaining in (3, 2, 1):
@@ -122,6 +122,25 @@ class Listener(Configurable):
 
         config.enabled = not config.enabled
         utils.print_state()
+
+    @staticmethod
+    def wait_for_minimap(seconds=20):
+        """
+        Waits for the minimap to be found on its own (it can't be while the game
+        window is covered), and only then falls back to a manual selection.
+        """
+
+        print(
+            '\n[~] The minimap has not been found yet. Bring the MapleStory window '
+            'to the front with its minimap visible...'
+        )
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if config.capture.calibrated:
+                print('[~] Minimap found.')
+                return True
+            time.sleep(0.05)
+        return Listener.recalibrate_minimap()
 
     @staticmethod
     def reload_routine():

@@ -17,9 +17,14 @@ from src.routine.components import Point
 from src.common.vkeys import press, click, key_down, key_up
 from src.common.interfaces import Configurable
 from src.modules.health import is_game_focused
+from src.modules.recovery import LevelRecovery
 
 
 # The rune's buff icon
+# Climb back to the patrol platform after being knocked off it (src/modules/recovery.py).
+# Off for now: farming on the ground, where there is nothing to fall from.
+FALL_RECOVERY = False
+
 RUNE_BUFF_TEMPLATE = cv2.imread('assets/rune_buff_template.jpg', 0)
 
 
@@ -57,6 +62,14 @@ class Bot(Configurable):
         self._auto_attack_movement = None
         self._patrol_direction = None
         self._patrol_until = 0
+        self._mob_attack_keys = ()
+        # Climbs back to the patrol platform after being knocked off it
+        self.recovery = LevelRecovery(
+            key_down, key_up, press,
+            position=lambda: config.player_pos,
+            active=lambda: config.enabled,
+        )
+        self._home_key = None
         self.thread = threading.Thread(target=self._main)
         self.thread.daemon = True
 
@@ -103,6 +116,9 @@ class Bot(Configurable):
                     press(self.config['Feed pet'], 1)
                     last_fed = now
 
+                self._set_patrol_home()
+                if self._recover_if_fallen():
+                    continue
                 self._service_loot_pickup()
                 if self._service_mob_attack():
                     continue
@@ -127,19 +143,82 @@ class Bot(Configurable):
                 config.routine.step()
             else:
                 self._set_auto_attack_movement(None)
+                self._release_mob_attack()
+                self._forget_patrol_home()
                 time.sleep(0.01)
+
+    def _set_patrol_home(self):
+        """
+        Tells the recovery which platform the patrol belongs on: the level of the
+        routine's Points, or, without a routine, wherever the character stands
+        when Auto Maple is switched on.
+        """
+
+        recovery = getattr(self, 'recovery', None)
+        if recovery is None:
+            return
+        points = tuple(
+            element.location for element in config.routine.sequence
+            if isinstance(element, Point)
+        ) if len(config.routine) > 0 else ()
+        key = points or 'standalone'
+        if key == self._home_key:
+            return
+        if points:
+            heights = sorted(y for _, y in points)
+            if heights[-1] - heights[0] > recovery.FALL_TOLERANCE:
+                recovery.clear_home()       # the routine itself changes levels
+            else:
+                xs = [x for x, _ in points]
+                recovery.set_home(heights[len(heights) // 2], min(xs), max(xs))
+        else:
+            position = config.player_pos
+            if not position or tuple(position) == (0, 0):
+                return                      # minimap position not known yet
+            recovery.set_home(position[1])
+        self._home_key = key
+
+    def _forget_patrol_home(self):
+        if getattr(self, '_home_key', None) is not None:
+            self._home_key = None
+            self.recovery.clear_home()
+
+    def _recover_if_fallen(self):
+        """Climbs back up if the character was knocked off the patrol platform."""
+
+        recovery = getattr(self, 'recovery', None)
+        if not FALL_RECOVERY or recovery is None or recovery.home_y is None:
+            return False
+        position = config.player_pos
+        recovery.observe(position)
+        if not recovery.fallen(position):
+            return False
+        if not is_game_focused():
+            return False
+        self._set_auto_attack_movement(None)
+        self._release_mob_attack()
+        keys = getattr(getattr(self.command_book, 'module', None), 'Key', None)
+        recovery.jump_key = getattr(keys, 'JUMP', None) or 'alt'
+        recovery.recover()
+        self._patrol_direction = None
+        return True
 
     def _run_standalone_mob_attack(self):
         tracker = config.capture.mob_tracker
         if not tracker.settings()['Enabled']:
             self._set_auto_attack_movement(None)
+            self._release_mob_attack()
             time.sleep(0.05)
             return
         if not is_game_focused():
             self._set_auto_attack_movement(None)
+            self._release_mob_attack()
             time.sleep(0.05)
             return
 
+        self._set_patrol_home()
+        if self._recover_if_fallen():
+            return
         self._service_loot_pickup()
         target = tracker.target()
         if target is not None:
@@ -148,6 +227,7 @@ class Bot(Configurable):
                 self._set_auto_attack_movement(None)
                 self._service_mob_attack()
             else:
+                self._release_mob_attack()
                 self._set_auto_attack_movement(
                     'left' if offset_x < 0 else 'right'
                 )
@@ -171,6 +251,7 @@ class Bot(Configurable):
         if direction != self._patrol_direction:
             self._patrol_until = now + self.PATROL_TURN_INTERVAL
         self._patrol_direction = direction
+        config.capture.mob_tracker.set_sweep_direction(direction)
         self._set_auto_attack_movement(direction)
 
     def _set_auto_attack_movement(self, direction):
@@ -197,27 +278,20 @@ class Bot(Configurable):
         return True
 
     def _service_mob_attack(self, movement_direction=None):
+        tracker = config.capture.mob_tracker
         direction, group_attack, group_count = (
-            config.capture.mob_tracker.consume_attack_action()
+            tracker.consume_attack_action()
         )
-        if direction is None:
-            return False
-        if (not group_attack and (
-                self.command_book is None
-                or 'cruelstab' not in self.command_book.dict)):
-            print(
-                '\n[!] Nearby enemy detected, but the loaded command book '
-                'does not provide CruelStab.'
-            )
-            return False
-
         if not is_game_focused():
-            print('\n[!] Enemy detected, but MapleStory is not focused; attack cancelled.')
+            self._release_mob_attack()
             return False
 
-        if movement_direction:
-            key_up(movement_direction)
-        if group_attack:
+        target = tracker.target()
+        group_in_range = tracker.group_in_range()
+        if group_attack and direction is not None:
+            self._release_mob_attack()
+            if movement_direction:
+                key_up(movement_direction)
             print(
                 f'\n[~] Group of {group_count} nearby enemies detected on the '
                 f'{direction}; turning and using Q.'
@@ -228,16 +302,56 @@ class Bot(Configurable):
             finally:
                 key_up(direction)
             press('q', 1, down_time=0.08, up_time=0.1)
-        else:
+            return True
+
+        if group_in_range:
+            self._release_mob_attack()
+            if movement_direction:
+                key_up(movement_direction)
+            return True
+        if target is None or not target[1]:
+            self._release_mob_attack()
+            return False
+
+        if (self.command_book is None
+                or 'cruelstab' not in self.command_book.dict):
+            self._release_mob_attack()
             print(
-                f'\n[~] Nearby enemy detected on the {direction}; executing CruelStab.'
+                '\n[!] Nearby enemy detected, but the loaded command book '
+                'does not provide CruelStab.'
             )
-            self.command_book['cruelstab'](
-                direction,
-                attacks=2,
-                repetitions=1
-            ).execute()
+            return False
+        attack_key = getattr(
+            self.command_book.module.Key, 'CRUEL_STAB', None
+        )
+        if not attack_key:
+            self._release_mob_attack()
+            print(
+                '\n[!] The loaded command book does not define a CruelStab key.'
+            )
+            return False
+
+        attack_direction = 'left' if target[0] < 0 else 'right'
+        if movement_direction:
+            key_up(movement_direction)
+        if self._auto_attack_movement is not None:
+            self._set_auto_attack_movement(None)
+        self._set_mob_attack_keys((attack_direction, attack_key))
         return True
+
+    def _set_mob_attack_keys(self, keys):
+        keys = tuple(keys)
+        if keys == self._mob_attack_keys:
+            return
+        self._release_mob_attack()
+        for key in keys:
+            key_down(key)
+        self._mob_attack_keys = keys
+
+    def _release_mob_attack(self):
+        for key in reversed(self._mob_attack_keys):
+            key_up(key)
+        self._mob_attack_keys = ()
 
     @utils.run_if_enabled
     def _solve_rune(self, model):

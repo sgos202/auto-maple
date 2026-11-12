@@ -10,8 +10,8 @@ class Minimap(LabelFrame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, 'Minimap', **kwargs)
 
-        self.WIDTH = 400
-        self.HEIGHT = 300
+        self.WIDTH = 220
+        self.HEIGHT = 150
         self.canvas = tk.Canvas(self, bg='black',
                                 width=self.WIDTH, height=self.HEIGHT,
                                 borderwidth=0, highlightthickness=0)

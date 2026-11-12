@@ -11,6 +11,8 @@ from src.modules.health import HP_TRIGGER_PERCENT
 class HealthPotion(Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(2, weight=1)
         self.monitor = config.capture.health
         current = self.monitor.settings()
 
@@ -40,8 +42,8 @@ class HealthPotion(Frame):
         self.key_box.bind('<<ComboboxSelected>>', self._apply_settings)
 
         self.status = tk.StringVar()
-        ttk.Label(self, textvariable=self.status).grid(
-            row=1, column=0, columnspan=4, sticky=tk.W, pady=(3, 0)
+        ttk.Label(self, textvariable=self.status, wraplength=700).grid(
+            row=1, column=0, columnspan=4, sticky=tk.EW, pady=(3, 0)
         )
         self._refresh_status()
 
@@ -77,7 +79,7 @@ class HealthPotion(Frame):
         current = self.monitor.settings()
         percent = self.monitor.current_percent()
         if percent is None:
-            text = 'HP bar not detected at the fixed bottom HUD position.'
+            text = ''
         else:
             routine_state = 'running' if config.enabled else 'paused'
             action = self.monitor.last_action()

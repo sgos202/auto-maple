@@ -18,7 +18,10 @@ class MobTracker(Configurable):
         'Threshold': 78,
         'Alignment Y': 0,
         'Enemy count': 1,
-        'Enemy alignments': ''
+        'Enemy alignments': '',
+        'Enemy speeds': '',
+        'Focus configured': False,
+        'Focused enemies': ''
     }
     TEMPLATE_DIRECTORY = '.settings'
     PLAYER_TEMPLATE_PATH = os.path.join(TEMPLATE_DIRECTORY, 'mob_player_badge.png')
@@ -27,8 +30,22 @@ class MobTracker(Configurable):
     PLAYER_MATCH_MIN_THRESHOLD = 0.60
     MOB_MATCH_MIN_THRESHOLD = 0.52
     MOB_MATCH_THRESHOLD_MARGIN = 0.20
-    MOB_TEMPLATE_SCALES = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
+    # Game sprites are always drawn at their real size; trying other sizes only
+    # produced false matches (small copies of a sample fit clouds and bushes).
+    MOB_TEMPLATE_SCALES = (1.0,)
+    # A sample is a box around the enemy, so it includes scenery that changes as the
+    # player moves. Matching uses only the enemy's own pixels (see _sample_mask), then
+    # checks the colours really are the enemy's: soft cloud shading correlates with a
+    # round mushroom's shape, but it is the wrong colour.
+    MASK_MIN_FRACTION = 0.2
+    MASK_MAX_FRACTION = 0.9
+    COLOR_TOLERANCE = 50        # mean absolute BGR difference over the enemy's pixels
+    JUMP_HEIGHT = 130           # enemies this far above the ground line are mid-jump
+    GROUND_MARGIN = 12
+    MASK_MATCH_STEP = 2         # shape matching runs at 1/2 size for speed
+    SAME_ENEMY_OVERLAP = 0.6    # box overlap that makes two samples' matches one enemy
     MATCH_INTERVAL = 6
+    FAST_MATCH_INTERVAL = 3
     ATTACK_COOLDOWN = 0.4
     ATTACK_RANGE = 60
     VERTICAL_TOLERANCE = 16
@@ -37,17 +54,22 @@ class MobTracker(Configurable):
     TARGET_CONFIRMATIONS = 2
     TARGET_LOST_GRACE_SECONDS = 1.5
     TARGET_LOCK_RADIUS = 32
+    TARGET_LOCK_X_RADIUS = 48    # a locked enemy may jump; follow it by horizontal position
     HP_BAR_SEARCH_HEIGHT = 42
-    HP_BAR_MAX_WIDTH = 70
-    HP_BAR_MAX_CENTER_OFFSET = 24
+    HP_BAR_MAX_WIDTH = 120
+    HP_BAR_MAX_CENTER_OFFSET = 48
     GROUP_MIN_ENEMIES = 3
     GROUP_HORIZONTAL_RADIUS = 72
     GROUP_VERTICAL_RADIUS = 64
+    FAST_VERTICAL_SEARCH_EXTRA = 48
+    FAST_VERTICAL_ATTACK_TOLERANCE = 48
+    FAST_LOCK_RADIUS = 64
 
     def __init__(self):
         self._lock = threading.Lock()
         self._player_template = None
         self._mob_templates = []
+        self._mask_cache = {}
         self._attack_direction = None
         self._target_offset_x = None
         self._target_vertical_offset = None
@@ -59,6 +81,9 @@ class MobTracker(Configurable):
         self._target_missed_scans = 0
         self._target_missed_since = None
         self._last_attack_time = 0
+        self._group_in_range = False
+        self._player_position = None
+        self._sweep_direction = 'right'
         self._frame_count = 0
         self._status = 'Calibrate the player badge and an enemy sample to begin.'
         self._load_error = ''
@@ -97,6 +122,7 @@ class MobTracker(Configurable):
             self._target_missed_scans = 0
             self._target_missed_since = None
             self._last_attack_time = 0
+            self._group_in_range = False
             self.save_config()
 
     def set_templates(self, frame, player_bounds, mob_bounds):
@@ -139,10 +165,15 @@ class MobTracker(Configurable):
         with self._lock:
             self._player_template = player_template
             self._mob_templates = mob_templates
+            self.config['Focus configured'] = False
+            self.config['Focused enemies'] = ''
             self.config['Alignment Y'] = mob_templates[0][1]
             self.config['Enemy count'] = len(mob_templates)
             self.config['Enemy alignments'] = ','.join(
                 str(alignment_y) for _, alignment_y in mob_templates
+            )
+            self.config['Enemy speeds'] = ','.join(
+                'normal' for _ in mob_templates
             )
             self._attack_direction = None
             self._target_offset_x = None
@@ -155,6 +186,7 @@ class MobTracker(Configurable):
             self._target_missed_scans = 0
             self._target_missed_since = None
             self._last_attack_time = 0
+            self._group_in_range = False
             self._load_error = ''
             self._status = (
                 f'{len(mob_templates)} enemy sample(s) saved. '
@@ -197,6 +229,90 @@ class MobTracker(Configurable):
         with self._lock:
             return self._player_template is not None and bool(self._mob_templates)
 
+    def enemy_samples(self):
+        with self._lock:
+            return [template.copy() for template, _ in self._mob_templates]
+
+    def focused_enemy_samples(self):
+        with self._lock:
+            if not self.config.get('Focus configured'):
+                return set(range(len(self._mob_templates)))
+            try:
+                indices = {
+                    int(value)
+                    for value in self.config.get('Focused enemies', '').split(',')
+                    if value
+                }
+            except (AttributeError, ValueError):
+                return set()
+            return {
+                index for index in indices
+                if 0 <= index < len(self._mob_templates)
+            }
+
+    def enemy_speed_profiles(self):
+        with self._lock:
+            return self._enemy_speed_profiles_locked()
+
+    def _enemy_speed_profiles_locked(self):
+        values = self.config.get('Enemy speeds', '').split(',')
+        return [
+            values[index] if index < len(values) and values[index] in {'normal', 'fast'}
+            else 'normal'
+            for index in range(len(self._mob_templates))
+        ]
+
+    def set_enemy_speed_profile(self, index, profile):
+        if profile not in {'normal', 'fast'}:
+            raise ValueError("Enemy speed profile must be 'normal' or 'fast'.")
+        with self._lock:
+            if not 0 <= index < len(self._mob_templates):
+                raise ValueError(f'No enemy sample exists at index {index}.')
+            profiles = self._enemy_speed_profiles_locked()
+            profiles[index] = profile
+            self.config['Enemy speeds'] = ','.join(profiles)
+            self._locked_target = None
+            self._pending_target = None
+            self.save_config()
+
+    def set_sweep_direction(self, direction):
+        if direction not in {'left', 'right'}:
+            raise ValueError("Sweep direction must be 'left' or 'right'.")
+        with self._lock:
+            self._sweep_direction = direction
+
+    def player_x(self):
+        with self._lock:
+            return None if self._player_position is None else self._player_position[0]
+
+    def group_in_range(self):
+        with self._lock:
+            return self._group_in_range
+
+    def set_focused_enemy_samples(self, indices):
+        with self._lock:
+            valid_indices = {
+                int(index) for index in indices
+                if 0 <= int(index) < len(self._mob_templates)
+            }
+            self.config['Focus configured'] = True
+            self.config['Focused enemies'] = ','.join(
+                str(index) for index in sorted(valid_indices)
+            )
+            self._locked_target = None
+            self._pending_target = None
+            self._target_missed_scans = 0
+            self._target_missed_since = None
+            self.save_config()
+
+    @staticmethod
+    def _preferred_candidates(positioned_candidates, focused_samples):
+        focused_candidates = [
+            item for item in positioned_candidates
+            if item[0][1] in focused_samples
+        ]
+        return focused_candidates or positioned_candidates
+
     def add_enemy_template(self, frame, player_bounds, mob_bounds):
         height, width = frame.shape[:2]
         (x1, y1), (x2, y2) = mob_bounds
@@ -224,9 +340,16 @@ class MobTracker(Configurable):
         with self._lock:
             self._mob_templates.append((mob_template, alignment_y))
             self.config['Enemy count'] = len(self._mob_templates)
+            if not self.config.get('Focus configured'):
+                self.config['Focused enemies'] = ','.join(
+                    str(index) for index in range(len(self._mob_templates))
+                )
             self.config['Enemy alignments'] = ','.join(
                 str(offset) for _, offset in self._mob_templates
             )
+            profiles = self._enemy_speed_profiles_locked()
+            profiles.append('normal')
+            self.config['Enemy speeds'] = ','.join(profiles)
             self._attack_direction = None
             self._target_offset_x = None
             self._target_vertical_offset = None
@@ -235,6 +358,7 @@ class MobTracker(Configurable):
             self._pending_target = None
             self._target_missed_scans = 0
             self._target_missed_since = None
+            self._group_in_range = False
             self._status = (
                 f'{len(self._mob_templates)} enemy samples saved. '
                 'Enable auto-attack and press the Start/stop key to test.'
@@ -340,7 +464,7 @@ class MobTracker(Configurable):
                 self._target_vertical_offset,
             )
 
-    def _hold_locked_target(self, player_x, enabled, bot_enabled):
+    def _hold_locked_target(self, player_x, player_y, enabled, bot_enabled):
         with self._lock:
             if self._locked_target is None:
                 return False
@@ -360,12 +484,13 @@ class MobTracker(Configurable):
                 self._target_attackable = False
                 return False
 
-            _, locked_x, _ = self._locked_target
+            template_index, locked_x, locked_y = self._locked_target
             self._target_offset_x = locked_x - player_x
+            # A locked enemy was on the player's level when last seen (it may only
+            # be hidden behind an effect or mid-jump), so only the distance matters.
+            self._target_vertical_offset = 0
             self._target_attackable = (
                 abs(self._target_offset_x) <= self.ATTACK_RANGE
-                and self._target_vertical_offset is not None
-                and abs(self._target_vertical_offset) <= self.VERTICAL_TOLERANCE
             )
             self._attack_direction = None
             if (self._target_attackable and enabled and bot_enabled
@@ -382,6 +507,149 @@ class MobTracker(Configurable):
                 f'{"continuing attack" if self._target_attackable else "holding target"}.'
             )
             return True
+
+    @classmethod
+    def _sample_mask(cls, template):
+        """
+        The enemy's own pixels inside its sample box (uint8, 255 = enemy), or None
+        when the split is not believable (then the whole box is matched as before).
+        """
+        if template.ndim != 3 or min(template.shape[:2]) < 12:
+            return None
+        height, width = template.shape[:2]
+        mask = np.zeros((height, width), np.uint8)
+        try:
+            cv2.grabCut(
+                np.ascontiguousarray(template[:, :, :3]), mask,
+                (2, 2, width - 4, height - 4),
+                np.zeros((1, 65)), np.zeros((1, 65)), 5, cv2.GC_INIT_WITH_RECT
+            )
+        except cv2.error:
+            return None
+        foreground = ((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD)).astype(np.uint8)
+        foreground = cv2.morphologyEx(
+            foreground, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+        )
+        if not cls.MASK_MIN_FRACTION <= foreground.mean() <= cls.MASK_MAX_FRACTION:
+            return None
+        return foreground * 255
+
+    def _mask_for(self, template):
+        cache = self.__dict__.setdefault('_mask_cache', {})
+        key = (template.shape, hash(template.tobytes()))
+        if key not in cache:
+            if len(cache) > 64:
+                cache.clear()
+            cache[key] = self._sample_mask(template)
+        return cache[key]
+
+    @classmethod
+    def _masked_matching_locations(cls, search, template, mask, threshold):
+        """Like _matching_locations, but on the enemy's pixels only plus a colour check."""
+        if (search.size == 0 or template.shape[0] > search.shape[0]
+                or template.shape[1] > search.shape[1]):
+            return [], 0.0
+        template = np.ascontiguousarray(template[:, :, :3])
+        search = np.ascontiguousarray(search[:, :, :3])
+        template_height, template_width = template.shape[:2]
+        # The shape match runs at half size (masked matching is slow); the colour
+        # check below runs at full size and also settles the exact position.
+        step = cls.MASK_MATCH_STEP if min(template_height, template_width) >= 24 else 1
+        if step > 1:
+            small = (template_width // step, template_height // step)
+            small_template = cv2.resize(template, small, interpolation=cv2.INTER_AREA)
+            small_mask = cv2.resize(mask, small, interpolation=cv2.INTER_NEAREST)
+            small_search = cv2.resize(
+                search, (search.shape[1] // step, search.shape[0] // step),
+                interpolation=cv2.INTER_AREA
+            )
+        else:
+            small_template, small_mask, small_search = template, mask, search
+        if (small_template.shape[0] > small_search.shape[0]
+                or small_template.shape[1] > small_search.shape[1]):
+            return [], 0.0
+        result = cv2.matchTemplate(
+            small_search, small_template, cv2.TM_CCOEFF_NORMED,
+            mask=cv2.merge([small_mask] * 3)
+        )
+        result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+        result[(result > 1.0) | (result < -1.0)] = 0.0
+        maxima = cv2.dilate(result, np.ones(small_template.shape[:2], dtype=np.uint8))
+        peak_y, peak_x = np.where((result >= threshold) & (result == maxima))
+        order = np.argsort(result[peak_y, peak_x])[::-1]
+        template_float = template.astype(np.float32)
+        inside = mask > 0
+        max_x = search.shape[1] - template_width
+        max_y = search.shape[0] - template_height
+        matches = []
+        for index in order:
+            score = float(result[peak_y[index], peak_x[index]])
+            best = None
+            for dy in range(0, step):
+                for dx in range(0, step):
+                    x = min(int(peak_x[index]) * step + dx, max_x)
+                    y = min(int(peak_y[index]) * step + dy, max_y)
+                    patch = search[y:y + template_height, x:x + template_width]
+                    difference = np.abs(
+                        patch.astype(np.float32) - template_float
+                    )[inside].mean()
+                    if best is None or difference < best[0]:
+                        best = (difference, x, y)
+            difference, x, y = best
+            if difference > cls.COLOR_TOLERANCE:
+                continue
+            if any(
+                abs(x - match[0][0]) < template_width
+                and abs(y - match[0][1]) < template_height
+                for match in matches
+            ):
+                continue
+            matches.append(((x, y), score))
+        if matches:
+            best_score = matches[0][1]
+        else:   # shape-only matches (wrong colours) don't count as near misses
+            best_score = min(float(result.max()), threshold - 0.01) if result.size else 0.0
+        return matches, best_score
+
+    @classmethod
+    def _merge_same_enemy(cls, positioned_candidates):
+        """
+        Different samples of one enemy match it at slightly different offsets.
+        Keeps the best-scoring match of each set of heavily overlapping boxes, so
+        one enemy is not counted twice (which would fake a group).
+        """
+        accepted = []
+        for item in sorted(positioned_candidates, key=lambda c: c[0][0], reverse=True):
+            candidate, center_x, center_y, _ = item
+            height, width = candidate[2].shape[:2]
+            duplicate = False
+            for other in accepted:
+                other_height, other_width = other[0][2].shape[:2]
+                overlap_x = (min(center_x + width / 2, other[1] + other_width / 2)
+                             - max(center_x - width / 2, other[1] - other_width / 2))
+                overlap_y = (min(center_y + height / 2, other[2] + other_height / 2)
+                             - max(center_y - height / 2, other[2] - other_height / 2))
+                if overlap_x <= 0 or overlap_y <= 0:
+                    continue
+                intersection = overlap_x * overlap_y
+                union = width * height + other_width * other_height - intersection
+                if intersection / union >= cls.SAME_ENEMY_OVERLAP:
+                    duplicate = True
+                    break
+            if not duplicate:
+                accepted.append(item)
+        return accepted
+
+    @staticmethod
+    def _ground_offset(mob_templates):
+        """
+        Where enemies' feet are relative to the player badge: the lowest bottom edge
+        among the samples (a sample taken mid-jump sits higher and is ignored).
+        """
+        return max(
+            alignment_y + template.shape[0] / 2
+            for template, alignment_y in mob_templates
+        )
 
     @staticmethod
     def _matching_locations(search, template, threshold):
@@ -432,50 +700,98 @@ class MobTracker(Configurable):
 
     @classmethod
     def _nearest_enemy_group(cls, positioned_candidates, player_x):
-        enemies = []
+        positioned_candidates = cls._deduplicate_positioned_candidates(
+            positioned_candidates
+        )
+        enemies = [
+            (
+                item[1],
+                item[2],
+                item[0][2].shape[1],
+                item[0][2].shape[0],
+                item,
+            )
+            for item in positioned_candidates
+        ]
+        groups = []
+        for anchor_x, anchor_y, _, _, _ in enemies:
+            component = [
+                enemy for enemy in enemies
+                if abs(enemy[0] - anchor_x) <= cls.GROUP_HORIZONTAL_RADIUS
+                and abs(enemy[1] - anchor_y) <= cls.GROUP_VERTICAL_RADIUS
+            ]
+            if len(component) < cls.GROUP_MIN_ENEMIES:
+                continue
+            if (
+                max(enemy[0] for enemy in component)
+                - min(enemy[0] for enemy in component)
+                > cls.GROUP_HORIZONTAL_RADIUS
+                or max(enemy[1] for enemy in component)
+                - min(enemy[1] for enemy in component)
+                > cls.GROUP_VERTICAL_RADIUS
+            ):
+                continue
+            members = [enemy[4] for enemy in component]
+            center_x = sum(enemy[0] for enemy in component) / len(component)
+            groups.append((abs(center_x - player_x), -len(component), members))
+
+        if not groups:
+            return []
+        return min(groups, key=lambda group: (group[0], group[1]))[2]
+
+    @staticmethod
+    def _deduplicate_positioned_candidates(positioned_candidates):
+        accepted = []
         for item in sorted(
             positioned_candidates,
             key=lambda candidate: candidate[0][0],
             reverse=True,
         ):
-            candidate, mob_x, mob_y, _ = item
-            template = candidate[2]
-            width, height = template.shape[1], template.shape[0]
-            duplicate = any(
-                abs(mob_x - existing[0]) < min(width, existing[2]) * 0.5
-                and abs(mob_y - existing[1]) < min(height, existing[3]) * 0.5
-                for existing in enemies
-            )
-            if not duplicate:
-                enemies.append((mob_x, mob_y, width, height, item))
-
-        groups = []
-        remaining = set(range(len(enemies)))
-        while remaining:
-            component = []
-            frontier = [remaining.pop()]
-            while frontier:
-                index = frontier.pop()
-                component.append(index)
-                x, y = enemies[index][:2]
-                neighbors = [
-                    other for other in remaining
-                    if abs(enemies[other][0] - x) <= cls.GROUP_HORIZONTAL_RADIUS
-                    and abs(enemies[other][1] - y) <= cls.GROUP_VERTICAL_RADIUS
-                ]
-                for other in neighbors:
-                    remaining.remove(other)
-                    frontier.append(other)
-            if len(component) >= cls.GROUP_MIN_ENEMIES:
-                members = [enemies[index][4] for index in component]
-                center_x = (
-                    sum(enemies[index][0] for index in component) / len(component)
+            candidate, center_x, center_y, _ = item
+            width = candidate[2].shape[1]
+            height = candidate[2].shape[0]
+            duplicate = False
+            for previous in accepted:
+                previous_candidate, previous_x, previous_y, _ = previous
+                previous_width = previous_candidate[2].shape[1]
+                previous_height = previous_candidate[2].shape[0]
+                close_centers = (
+                    abs(center_x - previous_x) < min(width, previous_width) * 0.25
+                    and abs(center_y - previous_y) < min(height, previous_height) * 0.25
                 )
-                groups.append((abs(center_x - player_x), -len(component), members))
+                if close_centers:
+                    duplicate = True
+                    break
+            if not duplicate:
+                accepted.append(item)
+        return accepted
 
-        if not groups:
-            return []
-        return min(groups, key=lambda group: (group[0], group[1]))[2]
+    @staticmethod
+    def _sweep_candidate(candidates, player_x, direction):
+        if direction == 'right':
+            forward = [item for item in candidates if item[1] >= player_x]
+            if forward:
+                return min(forward, key=lambda item: (item[1], -item[0][0]))
+        elif direction == 'left':
+            forward = [item for item in candidates if item[1] <= player_x]
+            if forward:
+                return max(forward, key=lambda item: (item[1], item[0][0]))
+        else:
+            raise ValueError(f'Unsupported sweep direction: {direction}')
+        return min(
+            candidates,
+            key=lambda item: (abs(item[1] - player_x), -item[0][0]),
+        )
+
+    @classmethod
+    def _group_in_attack_range(cls, group, player_x, player_y):
+        enemies_in_range = sum(
+            abs(item[1] - player_x) <= cls.ATTACK_RANGE
+            and abs(item[2] - (player_y + item[0][3]))
+            <= cls.GROUP_ATTACK_VERTICAL_TOLERANCE
+            for item in group
+        )
+        return enemies_in_range >= cls.GROUP_MIN_ENEMIES
 
     @classmethod
     def _health_bar_ratio(cls, frame, mob_bounds):
@@ -483,8 +799,11 @@ class MobTracker(Configurable):
         mob_center_x = (mob_x1 + mob_x2) // 2
         y1 = max(0, mob_y1 - cls.HP_BAR_SEARCH_HEIGHT)
         y2 = max(y1, mob_y1 - 4)
-        x1 = max(0, mob_center_x - cls.HP_BAR_MAX_CENTER_OFFSET - 8)
-        x2 = min(frame.shape[1], mob_center_x + cls.HP_BAR_MAX_CENTER_OFFSET + 9)
+        horizontal_margin = (
+            cls.HP_BAR_MAX_WIDTH // 2 + cls.HP_BAR_MAX_CENTER_OFFSET
+        )
+        x1 = max(0, mob_center_x - horizontal_margin)
+        x2 = min(frame.shape[1], mob_center_x + horizontal_margin + 1)
         region = frame[y1:y2, x1:x2, :3]
         if region.size == 0:
             return None
@@ -540,16 +859,24 @@ class MobTracker(Configurable):
                 self._attack_direction = None
                 self._attack_is_group = False
                 self._group_count = 0
+                self._group_in_range = False
                 self._target_offset_x = None
                 self._target_vertical_offset = None
                 self._target_attackable = False
                 self._status = 'Waiting for auto-attack to be enabled and started.'
                 return
-            if self._frame_count % self.MATCH_INTERVAL:
+            speed_profiles = self._enemy_speed_profiles_locked()
+            match_interval = (
+                self.FAST_MATCH_INTERVAL
+                if 'fast' in speed_profiles
+                else self.MATCH_INTERVAL
+            )
+            if self._frame_count % match_interval:
                 return
             self._attack_direction = None
             self._group_count = 0
             self._attack_is_group = False
+            self._group_in_range = False
             player_template = self._player_template
             mob_templates = self._mob_templates.copy()
             threshold = max(
@@ -563,6 +890,7 @@ class MobTracker(Configurable):
             )
             distance = self.config['Range']
 
+        focused_samples = self.focused_enemy_samples()
         if player_template is None or not mob_templates:
             with self._lock:
                 self._status = self._load_error
@@ -589,15 +917,22 @@ class MobTracker(Configurable):
         player_top, player_score = player_match
         player_x = player_top[0] + player_template.shape[1] // 2
         player_y = player_top[1] + player_template.shape[0] // 2
+        with self._lock:
+            self._player_position = (player_x, player_y)
         candidates = []
         sample_best_scores = []
-        for template_index, (mob_template, alignment_y) in enumerate(mob_templates):
+        # Every enemy on the player's platform stands on the same ground line, whatever
+        # sample found it, and may be anywhere from there up to a jump above it.
+        ground_offset = self._ground_offset(mob_templates)
+        for template_index, (mob_template, _) in enumerate(mob_templates):
             mob_search = gray
             if mob_template.ndim == 3:
                 mob_search = frame[:, :, :3]
+            mask = self._mask_for(mob_template)
             sample_candidates = []
             sample_best_score = 0.0
             for scale in self.MOB_TEMPLATE_SCALES:
+                scaled_mask = mask
                 if scale == 1.0:
                     scaled_template = mob_template
                 else:
@@ -613,27 +948,41 @@ class MobTracker(Configurable):
                             else cv2.INTER_CUBIC
                         )
                     )
+                    if mask is not None:
+                        scaled_mask = cv2.resize(
+                            mask, scaled_size, interpolation=cv2.INTER_NEAREST
+                        )
 
-                expected_mob_y = player_y + alignment_y
-                half_height = scaled_template.shape[0] // 2
+                template_height = scaled_template.shape[0]
+                # Centre of this sample when its enemy stands on the ground line
+                alignment_y = round(ground_offset - template_height / 2)
+                ground_y = player_y + ground_offset
                 y1 = max(
                     0,
-                    expected_mob_y - half_height - self.SEARCH_VERTICAL_TOLERANCE
+                    round(ground_y - template_height - self.JUMP_HEIGHT)
                 )
                 y2 = min(
                     gray.shape[0],
-                    expected_mob_y + half_height + self.SEARCH_VERTICAL_TOLERANCE
+                    round(ground_y + self.GROUND_MARGIN)
                 )
                 x1 = max(
                     0,
                     player_x - distance - scaled_template.shape[1]
                 )
                 x2 = min(gray.shape[1], player_x + distance)
-                mob_matches, best_score = self._matching_locations(
-                    mob_search[y1:y2, x1:x2],
-                    scaled_template,
-                    threshold
-                )
+                if scaled_mask is not None:
+                    mob_matches, best_score = self._masked_matching_locations(
+                        mob_search[y1:y2, x1:x2],
+                        scaled_template,
+                        scaled_mask,
+                        threshold
+                    )
+                else:
+                    mob_matches, best_score = self._matching_locations(
+                        mob_search[y1:y2, x1:x2],
+                        scaled_template,
+                        threshold
+                    )
                 sample_best_score = max(sample_best_score, best_score)
                 sample_candidates.extend(
                     (
@@ -674,7 +1023,9 @@ class MobTracker(Configurable):
                 self._attack_direction = None
                 self._attack_is_group = False
                 self._group_count = 0
-            if self._hold_locked_target(player_x, enabled, bot_enabled):
+            if self._hold_locked_target(
+                player_x, player_y, enabled, bot_enabled
+            ):
                 return
             with self._lock:
                 self._target_offset_x = None
@@ -709,6 +1060,12 @@ class MobTracker(Configurable):
                 candidate, mob_x, mob_y, health_ratio
             ))
 
+        positioned_candidates = self._merge_same_enemy(
+            self._deduplicate_positioned_candidates(positioned_candidates)
+        )
+        target_candidates = self._preferred_candidates(
+            positioned_candidates, focused_samples
+        )
         group = self._nearest_enemy_group(positioned_candidates, player_x)
         group_count = len(group)
         with self._lock:
@@ -718,28 +1075,31 @@ class MobTracker(Configurable):
         if locked_target is not None:
             _, locked_x, locked_y = locked_target
             locked_candidates = [
-                item for item in positioned_candidates
-                if abs(item[1] - locked_x) <= self.TARGET_LOCK_RADIUS
-                and abs(item[2] - locked_y) <= self.TARGET_LOCK_RADIUS
+                item for item in target_candidates
+                if abs(item[1] - locked_x) <= (
+                    self.FAST_LOCK_RADIUS
+                    if locked_target[0] < len(speed_profiles)
+                    and speed_profiles[locked_target[0]] == 'fast'
+                    else self.TARGET_LOCK_X_RADIUS
+                )
             ]
             if locked_candidates:
                 selected = min(
                     locked_candidates,
                     key=lambda item: abs(item[1] - locked_x)
-                    + abs(item[2] - locked_y)
+                    + 0.25 * abs(item[2] - locked_y)
                 )
             else:
-                if (not group
-                        and self._hold_locked_target(player_x, enabled, bot_enabled)):
+                if self._hold_locked_target(
+                    player_x, player_y, enabled, bot_enabled
+                ):
                     return
 
         if selected is None:
-            selected = min(
-                positioned_candidates,
-                key=lambda item: (
-                    abs(item[1] - player_x),
-                    -item[0][0]
-                )
+            with self._lock:
+                sweep_direction = self._sweep_direction
+            selected = self._sweep_candidate(
+                target_candidates, player_x, sweep_direction
             )
             candidate, selected_x, selected_y, _ = selected
             template_index = candidate[1]
@@ -777,23 +1137,18 @@ class MobTracker(Configurable):
         delta_x = mob_x - player_x
         delta_y = mob_y - (player_y + alignment_y)
         direction = 'left' if delta_x < 0 else 'right'
-        attackable = (
-            abs(delta_x) <= self.ATTACK_RANGE
-            and abs(delta_y) <= self.VERTICAL_TOLERANCE
-        )
+        # delta_y is 0 for an enemy standing on the player's ground line and negative
+        # while it is in the air; it comes back down, so a jump doesn't end the fight.
+        airborne = delta_y < -self.VERTICAL_TOLERANCE
+        on_level = -self.JUMP_HEIGHT - self.GROUND_MARGIN <= delta_y <= self.VERTICAL_TOLERANCE
+        attackable = abs(delta_x) <= self.ATTACK_RANGE and on_level
         group_direction = None
         group_in_range = False
         if group:
             group_center_x = sum(item[1] for item in group) / group_count
             group_direction = 'left' if group_center_x < player_x else 'right'
-            group_in_range = any(
-                abs(item[1] - player_x) <= self.ATTACK_RANGE
-                and abs(
-                    item[2] - (
-                        player_y + item[0][3]
-                    )
-                ) <= self.GROUP_ATTACK_VERTICAL_TOLERANCE
-                for item in group
+            group_in_range = self._group_in_attack_range(
+                group, player_x, player_y
             )
 
         with self._lock:
@@ -804,7 +1159,8 @@ class MobTracker(Configurable):
                 f'Locked enemy {mob_score:.0%} among {len(mob_templates)} sample(s), '
                 f'offset ({delta_x:+d}, {delta_y:+d}) px; '
                 f'{f"HP ~{health_ratio:.0%}; " if health_ratio is not None else ""}'
-                f'{"in attack range" if attackable else "approaching"} '
+                f'{"in attack range" if attackable else "approaching"}'
+                f'{" (enemy is jumping)" if airborne and on_level else ""} '
                 'on calibrated level.'
             )
             if group:
@@ -813,8 +1169,9 @@ class MobTracker(Configurable):
                     f'{"in group-attack range" if group_in_range else "approaching group"}.'
                 )
             self._target_offset_x = group_center_x - player_x if group else delta_x
-            self._target_vertical_offset = delta_y
+            self._target_vertical_offset = 0 if on_level else delta_y
             self._target_attackable = attackable or group_in_range
+            self._group_in_range = group_in_range and group_count >= self.GROUP_MIN_ENEMIES
             if not enabled or not bot_enabled:
                 self._attack_direction = None
                 self._attack_is_group = False

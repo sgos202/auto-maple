@@ -11,6 +11,12 @@ from src.gui import Menu, View, Edit, Settings, Log
 
 class GUI:
     DISPLAY_FRAME_RATE = 30
+    EDITABLE_WIDGET_CLASSES = {
+        'Button', 'Canvas', 'Checkbutton', 'Combobox', 'Entry', 'Listbox',
+        'Menubutton', 'Radiobutton', 'Scale', 'Spinbox', 'TButton',
+        'TCheckbutton', 'TCombobox', 'TEntry', 'TMenubutton', 'TRadiobutton',
+        'TScale', 'TSpinbox', 'Text'
+    }
     RESOLUTIONS = {
         'DEFAULT': '800x800',
         'Edit': '1400x800'
@@ -42,6 +48,10 @@ class GUI:
 
         self.navigation.pack(expand=True, fill='both')
         self.navigation.bind('<<NotebookTabChanged>>', self._resize_window)
+        self._control_states = {}
+        self._menu_states = []
+        self._controls_locked = None
+        self.root.after(100, self._sync_control_states)
         self.root.focus()
 
     def set_routine(self, arr):
@@ -94,6 +104,46 @@ class GUI:
         self.log.poll()
         self.root.after(100, self._poll_log)
 
+    def _sync_control_states(self):
+        """Lock editing controls while Auto Maple is running."""
+
+        locked = bool(config.enabled)
+        if locked != self._controls_locked:
+            if locked:
+                self._control_states.clear()
+                for widget in self._iter_widgets(self.root):
+                    if widget.winfo_class() not in GUI.EDITABLE_WIDGET_CLASSES:
+                        continue
+                    state = widget.cget('state')
+                    if state != tk.DISABLED:
+                        self._control_states[widget] = state
+                        widget.configure(state=tk.DISABLED)
+
+                self._menu_states = []
+                for index in range(self.menu.index('end') + 1):
+                    state = self.menu.entrycget(index, 'state')
+                    self._menu_states.append(state)
+                    self.menu.entryconfigure(index, state=tk.DISABLED)
+            else:
+                for widget, state in self._control_states.items():
+                    if widget.winfo_exists():
+                        widget.configure(state=state)
+                self._control_states.clear()
+
+                for index, state in enumerate(self._menu_states):
+                    self.menu.entryconfigure(index, state=state)
+                self._menu_states = []
+
+            self._controls_locked = locked
+
+        self.root.after(200, self._sync_control_states)
+
+    @staticmethod
+    def _iter_widgets(parent):
+        for widget in parent.winfo_children():
+            yield widget
+            yield from GUI._iter_widgets(widget)
+
     def _check_minimap_selection(self):
         capture = config.capture
         if capture.selection_requested.is_set():
@@ -142,6 +192,7 @@ class GUI:
                         parent=self.root
                     )
                     return
+                self.view.mob_tracker.refresh_samples()
                 print(
                     f'\n[~] Saved player badge and '
                     f'{len(mob_bounds_list)} enemy sample(s) from one screen.'
@@ -189,41 +240,38 @@ class GUI:
             )
             return
         frame = frame.copy()
-
-        def select_enemy(player_bounds):
-            if player_bounds is None:
-                return
-
-            def save_enemy(mob_bounds):
-                if mob_bounds is None:
-                    return
-                try:
-                    count = tracker.add_enemy_template(
-                        frame, player_bounds, mob_bounds
-                    )
-                except (OSError, ValueError) as error:
-                    messagebox.showerror(
-                        'Could not add enemy sample',
-                        str(error),
-                        parent=self.root
-                    )
-                    return
-                print(f'\n[~] Saved enemy sample {count}.')
-
-            self._show_screen_region_selection(
-                frame,
-                'Select another enemy',
-                'Drag tightly around one complete enemy sprite, excluding nearby drops and background, then press Enter.',
-                save_enemy,
-                min_size=(12, 12)
+        player_bounds = tracker.find_player_bounds(frame)
+        if player_bounds is None:
+            messagebox.showwarning(
+                'Player badge not found',
+                'Keep the saved player name badge visible, or calibrate the badge again.',
+                parent=self.root
             )
+            return
+
+        def save_enemy(mob_bounds):
+            if mob_bounds is None:
+                return
+            try:
+                count = tracker.add_enemy_template(
+                    frame, player_bounds, mob_bounds
+                )
+            except (OSError, ValueError) as error:
+                messagebox.showerror(
+                    'Could not add enemy sample',
+                    str(error),
+                    parent=self.root
+                )
+                return
+            self.view.mob_tracker.refresh_samples()
+            print(f'\n[~] Saved enemy sample {count}.')
 
         self._show_screen_region_selection(
             frame,
-            'Select player name badge',
-            'Select the current player name badge, then press Enter.',
-            select_enemy,
-            min_size=(20, 6)
+            'Select another enemy',
+            'Drag tightly around one complete enemy sprite, excluding nearby drops and background, then press Enter.',
+            save_enemy,
+            min_size=(12, 12)
         )
 
     def select_loot_templates(self):

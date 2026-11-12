@@ -10,7 +10,7 @@ class Routine(LabelFrame):
         self.scroll = tk.Scrollbar(self)
         self.scroll.pack(side=tk.RIGHT, fill='both', pady=5)
 
-        self.listbox = tk.Listbox(self, width=25,
+        self.listbox = tk.Listbox(self, width=25, height=3,
                                   listvariable=config.gui.routine_var,
                                   exportselection=False,
                                   activestyle='none',
@@ -20,7 +20,7 @@ class Routine(LabelFrame):
         self.listbox.bind('<Left>', lambda e: 'break')
         self.listbox.bind('<Right>', lambda e: 'break')
         self.listbox.bind('<<ListboxSelect>>', parent.details.show_details)
-        self.listbox.pack(side=tk.LEFT, expand=True, fill='both', padx=(5, 0), pady=5)
+        self.listbox.pack(side=tk.LEFT, fill='both', padx=(5, 0), pady=5)
 
         self.scroll.config(command=self.listbox.yview)
 

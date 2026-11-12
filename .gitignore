@@ -1,5 +1,8 @@
 __pycache__/
 assets/models/
+assets/violetta_training/
+runs/violetta/
+.venv-violetta/
 .idea/
 .settings/
 *.iml

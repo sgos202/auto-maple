@@ -111,6 +111,7 @@ class Capture:
             rect = wintypes.RECT()
             user32.GetWindowRect(handle, ctypes.pointer(rect))
             rect = (rect.left, rect.top, rect.right, rect.bottom)
+            covered = self._window_covered(handle, rect)
             rect = tuple(max(0, x) for x in rect)
 
             self.window['left'] = rect[0]
@@ -142,6 +143,18 @@ class Capture:
                 or br[1] <= tl[1]
             )
             manual_requested = self.manual_calibration_requested.is_set()
+            if automatic_match_failed and covered:
+                # The screenshot shows whatever is on top of the game, so neither
+                # the automatic match nor a manual selection can work yet.
+                if last_calibration_warning != 'covered':
+                    print(
+                        '\n[!] The MapleStory window is missing, minimised or covered '
+                        'by another window, so the minimap cannot be seen. Bring the '
+                        'game to the front; calibration continues automatically.'
+                    )
+                    last_calibration_warning = 'covered'
+                time.sleep(0.5)
+                continue
             if automatic_match_failed:
                 warning_key = 'corners'
                 warning = (
@@ -227,6 +240,35 @@ class Capture:
                     }
 
                     time.sleep(0.001)
+
+    @staticmethod
+    def _window_covered(handle, rect):
+        """
+        True when the game window is missing or another window sits on top of its
+        top-left area (where the minimap is). Screen capture would then show that
+        other window instead of the game.
+        """
+
+        if not handle or user32.IsIconic(handle):
+            return True
+        left, top, right, bottom = rect
+        width, height = right - left, bottom - top
+        if width <= 0 or height <= 0:
+            return True
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        user32.GetAncestor.restype = wintypes.HWND
+        for fraction_x, fraction_y in ((0.03, 0.08), (0.12, 0.08), (0.03, 0.22), (0.12, 0.22)):
+            point = wintypes.POINT(
+                int(left + width * fraction_x), int(top + height * fraction_y)
+            )
+            if point.x < 0 or point.y < 0:
+                return True         # that part of the window is off the screen
+            owner = user32.GetAncestor(user32.WindowFromPoint(point), 2)   # GA_ROOT
+            if owner != handle:
+                return True
+        return False
 
     def screenshot(self, delay=1):
         try:
