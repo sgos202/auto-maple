@@ -1,5 +1,6 @@
 """User friendly GUI to interact with Auto Maple."""
 
+import os
 import time
 import threading
 import tkinter as tk
@@ -51,6 +52,10 @@ class GUI:
         self._control_states = {}
         self._menu_states = []
         self._controls_locked = None
+        self._alarm_win = None          # the flashing mini-game button, while it shows
+        self._alarm_button = None
+        self._alarm_flash = False
+        self._alarm_click_through = None
         self.root.after(100, self._sync_control_states)
         self.root.focus()
 
@@ -84,15 +89,33 @@ class GUI:
             else:
                 self.root.geometry(GUI.RESOLUTIONS['DEFAULT'])
 
+    # Loaded on start-up so there is no setup step after a restart. Load
+    # another one from File > Load Command Book whenever needed.
+    DEFAULT_COMMAND_BOOK = 'begginer.py'
+
+    def _preload_command_book(self):
+        if config.bot is None or config.bot.command_book is not None:
+            return
+        path = os.path.join(config.RESOURCES_DIR, 'command_books', GUI.DEFAULT_COMMAND_BOOK)
+        if not os.path.isfile(path):
+            print(f'\n[!] Default command book not found: {path}')
+            return
+        try:
+            config.bot.load_commands(path)
+        except Exception as error:
+            print(f'\n[!] Could not preload command book {path}: {error}')
+
     def start(self):
         """Starts the GUI as well as any scheduled functions."""
 
+        self.root.after(50, self._preload_command_book)
         self.root.after(100, self._check_minimap_selection)
         self.root.after(100, self._poll_log)
+        self.root.after(250, self._poll_alarm)
 
-        display_thread = threading.Thread(target=self._display_minimap)
-        display_thread.daemon = True
-        display_thread.start()
+        # Tk is not thread-safe: drawing from a worker thread can freeze the
+        # whole window at random. The minimap is redrawn on the Tk thread.
+        self.root.after(100, self._display_minimap)
 
         layout_thread = threading.Thread(target=self._save_layout)
         layout_thread.daemon = True
@@ -114,6 +137,8 @@ class GUI:
                 for widget in self._iter_widgets(self.root):
                     if widget.winfo_class() not in GUI.EDITABLE_WIDGET_CLASSES:
                         continue
+                    if widget is self._alarm_button or getattr(widget, 'keep_enabled', False):
+                        continue        # stays usable while running (alarm, stay-on-channel)
                     state = widget.cget('state')
                     if state != tk.DISABLED:
                         self._control_states[widget] = state
@@ -138,6 +163,121 @@ class GUI:
 
         self.root.after(200, self._sync_control_states)
 
+    #################################
+    #   Mini-game alarm (screen)    #
+    #################################
+    ALARM_SIZE = (520, 170)
+    ALARM_COLOURS = (('#d00000', 'white'), ('#ffd400', 'black'))
+    ALARM_FLASH_MS = 400
+    ALARM_GAME_TITLE = 'MapleStory'
+
+    def _poll_alarm(self):
+        """Shows, flashes and removes the mini-game alarm button."""
+
+        from src.modules.mini_game_alarm import ALARM
+        try:
+            if ALARM.active:
+                if self._alarm_win is None or not self._alarm_win.winfo_exists():
+                    self._show_alarm()
+                self._update_alarm(ALARM.name)
+            elif self._alarm_win is not None:
+                self._hide_alarm()
+        except Exception as error:
+            print(f'\n[!] Mini-game alarm button failed: {error}')
+            self._alarm_win = self._alarm_button = None
+        self.root.after(GUI.ALARM_FLASH_MS, self._poll_alarm)
+
+    def _show_alarm(self):
+        from src.modules.mini_game_alarm import ALARM
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)                  # no title bar
+        win.attributes('-topmost', True)
+        win.attributes('-alpha', 0.95)              # makes it a layered window (click-through)
+        w, h = GUI.ALARM_SIZE
+
+        def clicked():
+            ALARM.dismiss()
+            self._hide_alarm()
+
+        button = tk.Button(win, font=('Segoe UI', 17, 'bold'), relief=tk.FLAT, bd=0,
+                           wraplength=w - 30, command=clicked, cursor='hand2')
+        button.pack(fill='both', expand=True)
+        self._alarm_win, self._alarm_button = win, button
+        self._alarm_click_through = None
+        self._alarm_geometry = None
+        self._alarm_overlaps = False
+        self._place_alarm()
+        win.update_idletasks()
+        self._set_alarm_style(click_through=False)
+
+    def _place_alarm(self):
+        """
+        As near the middle of the main screen as possible WITHOUT covering the
+        game: MapleStory draws its own mouse cursor, so anything on top of the game
+        hides the cursor (2026-11-15: the user couldn't see it to take over).
+        """
+        win = self._alarm_win
+        w, h = GUI.ALARM_SIZE
+        x, y, overlaps = alarm_spot(win.winfo_screenwidth(), win.winfo_screenheight(),
+                                    w, h, _game_rect(GUI.ALARM_GAME_TITLE))
+        geometry = f'{w}x{h}+{x}+{y}'
+        if geometry != self._alarm_geometry:
+            win.geometry(geometry)
+            self._alarm_geometry = geometry
+        self._alarm_overlaps = overlaps
+
+    def _set_alarm_style(self, click_through):
+        """
+        The button never takes focus from the game, is left out of screenshots (the
+        solvers capture the screen), and - only if it has to sit on top of the game
+        - lets clicks through while a solver is using the mouse there.
+        """
+        if click_through == self._alarm_click_through:
+            return
+        self._alarm_click_through = click_through
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self._alarm_win.wm_frame(), 16)
+            GWL_EXSTYLE = -20
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style |= 0x08000000 | 0x00000080 | 0x00080000    # noactivate, toolwindow, layered
+            if click_through:
+                style |= 0x00000020                          # transparent to the mouse
+            else:
+                style &= ~0x00000020
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            user32.SetWindowDisplayAffinity(hwnd, 0x11)      # WDA_EXCLUDEFROMCAPTURE
+        except Exception as error:
+            print(f'\n[!] Could not set up the alarm window: {error}')
+
+    def _update_alarm(self, name):
+        from src.modules import mini_games
+        self._place_alarm()                 # follow the game window if it moves
+        runner = mini_games.ACTIVE_RUNNER
+        solving = runner is not None and runner.busy
+        blocked = solving and self._alarm_overlaps
+        self._set_alarm_style(click_through=blocked)
+        self._alarm_flash = not self._alarm_flash
+        bg, fg = GUI.ALARM_COLOURS[self._alarm_flash]
+        game = name.split(' (')[0] if name else 'Mini-game'
+        if blocked:
+            text = f'⚠ {game} ⚠\nBeing solved automatically...\n(click here to silence once it ends)'
+        elif solving:
+            text = f'⚠ {game} ⚠\nBeing solved automatically\nCLICK HERE to stop the alarm'
+        else:
+            text = f'⚠ {game} ⚠\nCLICK HERE to stop the alarm'
+        self._alarm_button.configure(text=text, bg=bg, fg=fg, activebackground=bg,
+                                     activeforeground=fg, state=tk.NORMAL)
+
+    def _hide_alarm(self):
+        if self._alarm_win is not None:
+            try:
+                self._alarm_win.destroy()
+            except tk.TclError:
+                pass
+        self._alarm_win = self._alarm_button = None
+
     @staticmethod
     def _iter_widgets(parent):
         for widget in parent.winfo_children():
@@ -152,7 +292,8 @@ class GUI:
                 capture.selection_frame,
                 'Select minimap area',
                 'Drag around the minimap map area, including the player marker but not the title bar; then press Enter.',
-                capture.complete_minimap_selection
+                capture.complete_minimap_selection,
+                region=GUI.MINIMAP_SELECTION_REGION
             )
         self.root.after(100, self._check_minimap_selection)
 
@@ -392,17 +533,40 @@ class GUI:
             multiple=True
         )
 
+    # The part of the game screen shown (zoomed in) when selecting the minimap,
+    # as fractions of the screen: MapleStory keeps it in the top-left corner.
+    # Wide enough for long, flat maps; the dialog can still show the whole screen.
+    MINIMAP_SELECTION_REGION = (0.0, 0.0, 0.55, 0.45)
+    SELECTION_MAX_ZOOM = 3.0
+
     def _show_screen_region_selection(
             self, frame, title, instructions, on_selected, min_size=(10, 10),
-            multiple=False):
+            multiple=False, region=None, zoomed=True):
+        """REGION (x0, y0, x1, y1 as fractions of FRAME) shows only that part,
+        enlarged to fill the dialog, with a button to switch to the whole screen.
+        Selections are always returned in full-frame coordinates."""
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
         dialog.grab_set()
 
-        image = Image.fromarray(frame[:, :, :3][:, :, ::-1].copy())
-        max_width, max_height = 1050, 600
-        scale = min(1, max_width / image.width, max_height / image.height)
+        frame_h, frame_w = frame.shape[:2]
+        offset_x, offset_y = 0, 0
+        view = frame
+        if region is not None and zoomed:
+            x0 = max(0, min(frame_w - 1, int(region[0] * frame_w)))
+            y0 = max(0, min(frame_h - 1, int(region[1] * frame_h)))
+            x1 = max(x0 + 1, min(frame_w, int(round(region[2] * frame_w))))
+            y1 = max(y0 + 1, min(frame_h, int(round(region[3] * frame_h))))
+            view = frame[y0:y1, x0:x1]
+            offset_x, offset_y = x0, y0
+
+        image = Image.fromarray(view[:, :, :3][:, :, ::-1].copy())
+        # Fit the dialog to the monitor it opens on (big screens get a big view).
+        max_width = max(400, min(1600, self.root.winfo_screenwidth() - 120))
+        max_height = max(300, min(1000, self.root.winfo_screenheight() - 220))
+        max_zoom = GUI.SELECTION_MAX_ZOOM if view is not frame else 1
+        scale = min(max_zoom, max_width / image.width, max_height / image.height)
         display_size = (round(image.width * scale), round(image.height * scale))
         display_image = ImageTk.PhotoImage(image.resize(display_size, Image.Resampling.LANCZOS))
 
@@ -463,13 +627,14 @@ class GUI:
                     max(y1, event.y)
                 )
                 image_bounds = tuple(
-                    max(0, min(limit, round(value / scale)))
-                    for value, limit in zip(
+                    max(0, min(limit, round(value / scale))) + offset
+                    for value, limit, offset in zip(
                         bounds,
                         (
                             image.width, image.height,
                             image.width, image.height
-                        )
+                        ),
+                        (offset_x, offset_y, offset_x, offset_y)
                     )
                 )
                 if (image_bounds[2] - image_bounds[0] >= min_size[0]
@@ -530,12 +695,29 @@ class GUI:
         ttk.Button(buttons, text='Cancel', command=cancel_selection).pack(
             side=tk.LEFT, padx=4
         )
+        if region is not None:
+            def toggle_zoom():
+                dialog.destroy()
+                self._show_screen_region_selection(
+                    frame, title, instructions, on_selected, min_size=min_size,
+                    multiple=multiple, region=region, zoomed=not zoomed
+                )
+
+            ttk.Button(
+                buttons,
+                text='Show whole screen' if zoomed else 'Zoom to top-left',
+                command=toggle_zoom
+            ).pack(side=tk.LEFT, padx=4)
 
     def _display_minimap(self):
-        delay = 1 / GUI.DISPLAY_FRAME_RATE
-        while True:
+        try:
             self.view.minimap.display_minimap()
-            time.sleep(delay)
+        except Exception as error:
+            now = time.monotonic()
+            if now - getattr(self, '_display_error_at', 0) > 30:
+                self._display_error_at = now
+                print(f'\n[!] Minimap display failed: {error}')
+        self.root.after(max(1, int(1000 / GUI.DISPLAY_FRAME_RATE)), self._display_minimap)
 
     def _save_layout(self):
         """Periodically saves the current Layout object."""
@@ -549,3 +731,58 @@ class GUI:
 if __name__ == '__main__':
     gui = GUI()
     gui.start()
+
+
+def _game_rect(title):
+    """The game window's (left, top, right, bottom) on screen, or None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd or user32.IsIconic(hwnd):
+            return None
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        return None
+
+
+def alarm_spot(screen_w, screen_h, w, h, game, margin=12):
+    """
+    Top-left (x, y) for a W x H box as close to the screen centre as possible
+    without overlapping GAME (left, top, right, bottom), and whether it still
+    overlaps (no room anywhere: then it goes to the top edge).
+    """
+    cx, cy = (screen_w - w) / 2, (screen_h - h) / 2
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    if game is None:
+        return int(cx), int(cy), False
+    left, top, right, bottom = game
+    left, top, right, bottom = left - margin, top - margin, right + margin, bottom + margin
+
+    def overlaps(x, y):
+        return x < right and x + w > left and y < bottom and y + h > top
+
+    if not overlaps(cx, cy):
+        return int(cx), int(cy), False
+    spots = []
+    x_any, y_any = clamp(cx, 0, screen_w - w), clamp(cy, 0, screen_h - h)
+    if bottom <= screen_h - h:
+        spots.append((x_any, clamp(cy, bottom, screen_h - h)))     # below the game
+    if top - h >= 0:
+        spots.append((x_any, clamp(cy, 0, top - h)))                # above
+    if left - w >= 0:
+        spots.append((clamp(cx, 0, left - w), y_any))               # left of it
+    if right <= screen_w - w:
+        spots.append((clamp(cx, right, screen_w - w), y_any))       # right of it
+    spots = [s for s in spots if not overlaps(*s)]
+    if not spots:
+        return int(x_any), 0, True
+    x, y = min(spots, key=lambda s: (s[0] - cx) ** 2 + (s[1] - cy) ** 2)
+    return int(x), int(y), False

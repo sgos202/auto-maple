@@ -1,5 +1,6 @@
 """A module for tracking useful in-game information."""
 
+import gc
 import time
 import cv2
 import threading
@@ -9,9 +10,11 @@ import mss.windows
 import numpy as np
 from src.common import config, utils
 from ctypes import wintypes
-from src.modules.health import HealthPotionMonitor
+from src.modules.health import HealthPotionMonitor, ManaPotionMonitor
 from src.modules.loot_tracker import LootTracker
 from src.modules.mob_tracker import MobTracker
+from src.modules.minimap_finder import find_minimap_area
+from src.modules.watchdog import watchdog
 user32 = ctypes.windll.user32
 user32.SetProcessDPIAware()
 
@@ -41,6 +44,54 @@ MMT_WIDTH = max(MM_TL_TEMPLATE.shape[1], MM_BR_TEMPLATE.shape[1])
 PLAYER_TEMPLATE = cv2.imread('assets/player_template.png', 0)
 PT_HEIGHT, PT_WIDTH = PLAYER_TEMPLATE.shape
 
+# bug-2.mp4: at the map's very end the marker sits on the minimap's border,
+# half outside the cropped map area. It matched at 0.88 in a crop a few px
+# wider and not at all in the map area, so the bot lost its position there.
+MINIMAP_EDGE_PAD = 8
+PLAYER_MATCH_THRESHOLD = 0.8
+
+# The minimap is found on its own from its white outline (minimap_finder).
+# It keeps looking; after this long without finding it the console says so.
+# The draw-it-by-hand window only opens when asked for (Start/stop, reload).
+WARN_NOT_FOUND_AFTER = 8.0
+# Asking to recalibrate again this soon after an automatic find means the
+# automatic area is wrong: the user then draws it by hand.
+MANUAL_OVERRIDE_WINDOW = 15.0
+# While running: how often the game window's place and a lost marker are checked,
+# and how long the marker must be gone before the minimap is looked for again
+# (a new map has a minimap of another size).
+RECHECK_SECONDS = 2.0
+MARKER_LOST_SECONDS = 3.0
+
+
+def locate_player(frame, mm_tl, mm_br, template=None, pad=MINIMAP_EDGE_PAD):
+    """
+    The player's marker as (x, y) relative to the minimap area (x in 0..1,
+    y scaled like utils.convert_to_relative), or None. The map area is
+    searched first; failing that, a crop PAD px wider on each side, with the
+    result clamped onto the map's edge.
+    """
+    template = PLAYER_TEMPLATE if template is None else template
+    minimap = frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
+    found = utils.multi_match(minimap, template, threshold=PLAYER_MATCH_THRESHOLD)
+    if found:
+        return utils.convert_to_relative(found[0], minimap)
+    x1, y1 = max(0, mm_tl[0] - pad), max(0, mm_tl[1] - pad)
+    x2, y2 = min(frame.shape[1], mm_br[0] + pad), min(frame.shape[0], mm_br[1] + pad)
+    wide = frame[y1:y2, x1:x2]
+    if wide.shape[0] < template.shape[0] or wide.shape[1] < template.shape[1]:
+        return None
+    gray = cv2.cvtColor(wide, cv2.COLOR_BGR2GRAY) if wide.ndim == 3 else wide
+    result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+    _, best, _, top_left = cv2.minMaxLoc(result)
+    if best < PLAYER_MATCH_THRESHOLD:
+        return None
+    width, height = minimap.shape[1], minimap.shape[0]
+    cx = top_left[0] + template.shape[1] / 2 + x1 - mm_tl[0]
+    cy = top_left[1] + template.shape[0] / 2 + y1 - mm_tl[1]
+    point = (min(max(cx, 0), width - 1), min(max(cy, 0), height - 1))
+    return utils.convert_to_relative(point, minimap)
+
 
 class Capture:
     """
@@ -56,6 +107,7 @@ class Capture:
 
         self.frame = None
         self.health = HealthPotionMonitor()
+        self.mana = ManaPotionMonitor()
         self.mob_tracker = MobTracker()
         self.loot_tracker = LootTracker()
         self.minimap = {}
@@ -72,25 +124,50 @@ class Capture:
         self.ready = False
         self.calibrated = False
         self.manual_calibration_requested = threading.Event()
+        self.found_automatically_at = float('-inf')
         self.selection_requested = threading.Event()
         self.selection_completed = threading.Event()
         self.selection_frame = None
         self.selection_result = None
-        self.thread = threading.Thread(target=self._main)
-        self.thread.daemon = True
+        self._generation = 0
+        self.thread = self._new_thread()
+
+    STALL_SECONDS = 10      # no frame for this long: the watchdog restarts capture
+
+    def _new_thread(self):
+        self._generation += 1
+        thread = threading.Thread(target=self._main, args=(self._generation,),
+                                  name='capture', daemon=True)
+        return thread
 
     def start(self):
         """Starts this Capture's thread."""
 
         print('\n[~] Started video capture')
+        watchdog.register('capture', self.STALL_SECONDS, restart=self.restart)
         self.thread.start()
+
+    def restart(self):
+        """A fresh capture thread (the watchdog's hook). The stuck one sees its
+        generation is old and exits if it ever wakes up."""
+        self.calibrated = False
+        self.thread = self._new_thread()
+        self.thread.start()
+
+    def _stale(self, generation):
+        return generation != self._generation
 
     def request_minimap_selection(self, frame):
         self.selection_frame = frame.copy()
         self.selection_result = None
         self.selection_completed.clear()
         self.selection_requested.set()
-        if not self.selection_completed.wait(timeout=120):
+        watchdog.pause('capture')      # waiting for the user is not a stall
+        try:
+            completed = self.selection_completed.wait(timeout=120)
+        finally:
+            watchdog.resume('capture')
+        if not completed:
             print('\n[!] Manual minimap selection timed out.')
             return None
         return self.selection_result
@@ -99,18 +176,104 @@ class Capture:
         self.selection_result = selection
         self.selection_completed.set()
 
-    def _main(self):
+    def find_outline(self, frame):
+        """The minimap's map area found from its white outline, with the
+        player's marker seen inside it; None when it is not on screen."""
+        try:
+            area = find_minimap_area(
+                frame, accept=lambda tl, br: locate_player(frame, tl, br) is not None,
+                strict=True)
+        except Exception as error:
+            self._report_error('minimap finder', error)
+            return None
+        if area is None:
+            return None
+        (x1, y1), (x2, y2) = area
+        if x2 - x1 < PT_WIDTH or y2 - y1 < PT_HEIGHT:
+            return None
+        return area
+
+    @staticmethod
+    def _game_restarting():
+        try:
+            from src.modules import game_restart
+            return game_restart.RUNNER.busy
+        except Exception:
+            return False
+
+    @staticmethod
+    def game_window_rect():
+        handle = user32.FindWindowW(None, 'MapleStory')
+        rect = wintypes.RECT()
+        user32.GetWindowRect(handle, ctypes.pointer(rect))
+        return handle, (rect.left, rect.top, rect.right, rect.bottom)
+
+    ERROR_REPORT_SECONDS = 30       # one console line per failing part this often
+
+    def _process_modules(self, frame):
+        """The per-frame detectors, each guarded: one failing (e.g. out of
+        memory) skips only its own work for this frame."""
+        steps = (
+            ('health', lambda: self.health.process_frame(frame)),
+            ('mana', lambda: self.mana.process_frame(frame, self.health.last_region())),
+            ('mob tracker', lambda: self.mob_tracker.process_frame(frame, config.enabled)),
+            ('loot tracker', lambda: self.loot_tracker.process_frame(frame, config.enabled)),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception as error:
+                self._report_error(name, error)
+                if isinstance(error, MemoryError) or 'Insufficient memory' in str(error):
+                    gc.collect()
+                    time.sleep(0.2)     # let memory free up instead of failing every frame
+
+    def _report_error(self, name, error):
+        reported = self.__dict__.setdefault('_error_reports', {})
+        now = time.monotonic()
+        last, count = reported.get(name, (0.0, 0))
+        count += 1
+        if now - last >= self.ERROR_REPORT_SECONDS:
+            print('\n' f'[!] Capture: {name} failed ({count}x in the last '
+                  f'{self.ERROR_REPORT_SECONDS}s): {str(error).strip()[:200]}')
+            reported[name] = (now, 0)
+        else:
+            reported[name] = (last, count)
+
+    def _main(self, generation=None):
+        """Runs the capture loop for good: an error restarts it after a pause
+        instead of ending the thread (the bot would lose the minimap position
+        and patrol blind - left/right on a timer - for as long as it runs)."""
+        backoff = 1.0
+        generation = self._generation if generation is None else generation
+        while not self._stale(generation):
+            started = time.monotonic()
+            try:
+                self._capture_loop(generation)
+            except Exception as error:
+                self.calibrated = False
+                self._report_error('capture loop', error)
+                gc.collect()
+                if time.monotonic() - started > 60:
+                    backoff = 1.0       # it had been running fine
+                waited = 0.0
+                while waited < backoff:     # an error pause is not a stall
+                    watchdog.heartbeat('capture')
+                    time.sleep(0.5)
+                    waited += 0.5
+                backoff = min(backoff * 2, 30.0)
+
+    def _capture_loop(self, generation):
         """Constantly monitors the player's position and in-game events."""
 
         mss.windows.CAPTUREBLT = 0
         last_calibration_warning = None
-        manual_calibration_prompted = False
-        while True:
+        failing_since = None
+        while not self._stale(generation):
+            watchdog.heartbeat('capture')
             # Calibrate screen capture
-            handle = user32.FindWindowW(None, 'MapleStory')
-            rect = wintypes.RECT()
-            user32.GetWindowRect(handle, ctypes.pointer(rect))
-            rect = (rect.left, rect.top, rect.right, rect.bottom)
+            handle, rect = self.game_window_rect()
+            window_rect = rect
             covered = self._window_covered(handle, rect)
             rect = tuple(max(0, x) for x in rect)
 
@@ -126,23 +289,43 @@ class Capture:
                 continue
             if not self.ready:
                 self.ready = True
-            self.health.process_frame(self.frame)
-            self.mob_tracker.process_frame(self.frame, config.enabled)
-            self.loot_tracker.process_frame(self.frame, config.enabled)
+            self._process_modules(self.frame)
 
-            tl, _, tl_score, _ = utils.multi_scale_match(
-                self.frame, MM_TL_TEMPLATE, MINIMAP_TEMPLATE_SCALES
-            )
-            _, br, br_score, _ = utils.multi_scale_match(
-                self.frame, MM_BR_TEMPLATE, MINIMAP_TEMPLATE_SCALES
-            )
-            manual_calibration = False
-            automatic_match_failed = (
-                min(tl_score, br_score) < MINIMAP_MATCH_THRESHOLD
-                or br[0] <= tl[0]
-                or br[1] <= tl[1]
-            )
             manual_requested = self.manual_calibration_requested.is_set()
+            # A second request right after an automatic find: draw it by hand.
+            by_hand = manual_requested and (
+                time.monotonic() - self.found_automatically_at < MANUAL_OVERRIDE_WINDOW)
+            outline = None if by_hand else self.find_outline(self.frame)
+            manual_calibration = False
+            if outline is not None:
+                automatic_match_failed = False
+                manual_requested = False
+            else:
+                tl, _, tl_score, _ = utils.multi_scale_match(
+                    self.frame, MM_TL_TEMPLATE, MINIMAP_TEMPLATE_SCALES
+                )
+                _, br, br_score, _ = utils.multi_scale_match(
+                    self.frame, MM_BR_TEMPLATE, MINIMAP_TEMPLATE_SCALES
+                )
+                automatic_match_failed = (
+                    min(tl_score, br_score) < MINIMAP_MATCH_THRESHOLD
+                    or br[0] <= tl[0]
+                    or br[1] <= tl[1]
+                )
+                if not automatic_match_failed:
+                    # The corner pictures are from another game version and can
+                    # match scenery: only believed with the player's marker inside.
+                    corner_tl = (tl[0] + MINIMAP_BOTTOM_BORDER, tl[1] + MINIMAP_TOP_BORDER)
+                    corner_br = (
+                        max(corner_tl[0] + PT_WIDTH, br[0] - MINIMAP_BOTTOM_BORDER),
+                        max(corner_tl[1] + PT_HEIGHT, br[1] - MINIMAP_BOTTOM_BORDER)
+                    )
+                    automatic_match_failed = locate_player(
+                        self.frame, corner_tl, corner_br) is None
+            if not automatic_match_failed or covered or self._game_restarting():
+                failing_since = None        # nothing to find yet is not a failure
+            elif failing_since is None:
+                failing_since = time.monotonic()
             if automatic_match_failed and covered:
                 # The screenshot shows whatever is on top of the game, so neither
                 # the automatic match nor a manual selection can work yet.
@@ -155,18 +338,18 @@ class Capture:
                     last_calibration_warning = 'covered'
                 time.sleep(0.5)
                 continue
-            if automatic_match_failed:
-                warning_key = 'corners'
-                warning = (
-                    '[!] Could not reliably locate the minimap corners '
-                    f'(scores: {tl_score:.2f}, {br_score:.2f}). '
-                    'Keep the game minimap visible and at its default size.'
+            if (automatic_match_failed and not manual_requested
+                    and failing_since is not None
+                    and time.monotonic() - failing_since >= WARN_NOT_FOUND_AFTER
+                    and last_calibration_warning != 'not found'):
+                print(
+                    '\n[!] The minimap has not been found yet. Keep it open on the '
+                    'map view (not collapsed) with nothing over it, the mouse '
+                    'pointer included; looking continues on its own. To draw it by '
+                    'hand instead, press Start/stop.'
                 )
-                if warning_key != last_calibration_warning:
-                    print(f'\n{warning}')
-                    last_calibration_warning = warning_key
-            if manual_requested or (automatic_match_failed and not manual_calibration_prompted):
-                manual_calibration_prompted = True
+                last_calibration_warning = 'not found'
+            if manual_requested:
                 self.manual_calibration_requested.clear()
                 print(
                     '[~] Select the minimap map area in the app window '
@@ -182,6 +365,8 @@ class Capture:
             elif automatic_match_failed:
                 time.sleep(0.5)
                 continue
+            elif outline is not None:
+                mm_tl, mm_br = outline
             else:
                 mm_tl = (
                     tl[0] + MINIMAP_BOTTOM_BORDER,
@@ -203,32 +388,47 @@ class Capture:
 
             if manual_calibration:
                 print('\n[~] Minimap calibrated using the selected area.')
+            elif outline is not None:
+                self.found_automatically_at = time.monotonic()
+                print(f'\n[~] Minimap found automatically: {mm_br[0] - mm_tl[0]}x'
+                      f'{mm_br[1] - mm_tl[1]} px at ({mm_tl[0]}, {mm_tl[1]}) in the game '
+                      'window. (Wrong area? Recalibrate twice within '
+                      f'{MANUAL_OVERRIDE_WINDOW:.0f} s to draw it by hand.)')
             self.manual_calibration_requested.clear()
             self.minimap_ratio = (mm_br[0] - mm_tl[0]) / (mm_br[1] - mm_tl[1])
             self.minimap_sample = self.frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
             last_calibration_warning = None
             self.calibrated = True
+            last_recheck = last_seen = time.monotonic()
 
             with mss.mss() as self.sct:
-                while True:
+                while not self._stale(generation):
+                    watchdog.heartbeat('capture')
                     if not self.calibrated:
                         break
+                    now = time.monotonic()
+                    if now - last_recheck >= RECHECK_SECONDS:
+                        last_recheck = now
+                        if self._needs_recalibration(
+                                window_rect, (mm_tl, mm_br), manual_calibration,
+                                now - last_seen >= MARKER_LOST_SECONDS):
+                            self.calibrated = False
+                            break
 
                     # Take screenshot
                     self.frame = self.screenshot()
                     if self.frame is None:
                         continue
-                    self.health.process_frame(self.frame)
-                    self.mob_tracker.process_frame(self.frame, config.enabled)
-                    self.loot_tracker.process_frame(self.frame, config.enabled)
+                    self._process_modules(self.frame)
 
                     # Crop the frame to only show the minimap
                     minimap = self.frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
 
                     # Determine the player's position
-                    player = utils.multi_match(minimap, PLAYER_TEMPLATE, threshold=0.8)
-                    if player:
-                        config.player_pos = utils.convert_to_relative(player[0], minimap)
+                    player = locate_player(self.frame, mm_tl, mm_br)
+                    if player is not None:
+                        config.player_pos = player
+                        config.player_pos_time = last_seen = time.monotonic()
 
                     # Package display information to be polled by GUI
                     self.minimap = {
@@ -240,6 +440,27 @@ class Capture:
                     }
 
                     time.sleep(0.001)
+
+    def _needs_recalibration(self, window_rect, area, drawn_by_hand, marker_lost):
+        """True when the minimap has to be found again: the game window moved,
+        was resized or is a new one (the game was restarted), or the player's
+        marker is gone and the minimap now sits elsewhere or has another size
+        (a new map). An area drawn by hand is only dropped for a window change."""
+        try:
+            handle, rect = self.game_window_rect()
+        except Exception:
+            return False
+        if rect != window_rect:
+            if handle:
+                print('\n[~] The game window moved or is a new one; finding the minimap again.')
+            return True
+        if not marker_lost or drawn_by_hand or self.frame is None:
+            return False
+        outline = self.find_outline(self.frame)
+        if outline is not None and tuple(outline) != tuple(area):
+            print('\n[~] The minimap changed (a new map?); finding it again.')
+            return True
+        return False
 
     @staticmethod
     def _window_covered(handle, rect):

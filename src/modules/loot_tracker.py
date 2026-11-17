@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 
 import cv2
 
@@ -28,7 +29,16 @@ class LootTracker(Configurable):
         'drop_white.png'
     )
     LOOT_KEY = 'x'
-    MATCH_INTERVAL = 8
+    MATCH_INTERVAL = 8              # (unused: scans run by time, SCAN_INTERVAL)
+    # By time, not every Nth frame: a heavy enemy scan (Pig Beach) slows the
+    # capture loop to ~15 frames/s, and every 8th frame was a scan per ~0.6 s,
+    # too rare to ever see an item twice while walking over it.
+    SCAN_INTERVAL = 0.15
+    # After a pickup request, wait this long before another. (It used to wait
+    # until the item's screen spot came up empty 3 scans running, but loot under
+    # the character is always at the same screen spot, and the character's own
+    # feet keep matching there, so it could stay blocked for good.)
+    PICKUP_COOLDOWN = 0.8
     MATCH_THRESHOLD = 0.5
     HIGH_CONFIDENCE_THRESHOLD = 0.72
     MATCH_SCALES = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5)
@@ -38,6 +48,11 @@ class LootTracker(Configurable):
     MIN_BOB_MOTION = 2
     DETECTION_CONFIRMATIONS = 2
     MISS_REARM_CONFIRMATIONS = 3
+    # Drops lying around the character (not only under it), from colour
+    # samples in assets/loot_samples/<map>/ (src/detection/drop_finder.py).
+    # ~40 ms a scan, so not every loot scan.
+    DROP_SCAN_INTERVAL = 0.3
+    DROP_MAX_AGE = 0.6
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -51,7 +66,12 @@ class LootTracker(Configurable):
         self._missed_scans = 0
         self._latched_target = None
         self._frame_count = 0
-        self._status = 'Built-in loot samples will load when the player badge is calibrated.'
+        self._last_scan = float('-inf')
+        self._cooldown_until = float('-inf')
+        self._last_drop_scan = float('-inf')
+        self._ground_drops = (float('-inf'), [])
+        self._drop_finder = None
+        self._status ='Built-in loot samples will load when the player badge is calibrated.'
         self._load_error = ''
         super().__init__('loot_tracker')
         self._load_templates()
@@ -226,6 +246,29 @@ class LootTracker(Configurable):
         with self._lock:
             return self._status
 
+    def _scan_ground_drops(self, frame, player_bounds):
+        now = time.monotonic()
+        if now - self.__dict__.get('_last_drop_scan', float('-inf')) < self.DROP_SCAN_INTERVAL:
+            return
+        self._last_drop_scan = now
+        finder = self.__dict__.get('_drop_finder')
+        if finder is None:
+            from src.detection.drop_finder import DropFinder
+            finder = self._drop_finder = DropFinder()
+        if not finder.ready:
+            return
+        drops = finder.find(frame, player_bounds)
+        with self._lock:
+            self._ground_drops = (now, drops)
+
+    def ground_drops(self):
+        """Drops seen lately around the character: [(x offset px, y, score)], nearest first."""
+        with self._lock:
+            seen, drops = self.__dict__.get('_ground_drops', (float('-inf'), []))
+        if time.monotonic() - seen > self.DROP_MAX_AGE:
+            return []
+        return list(drops)
+
     def consume_pickup(self):
         with self._lock:
             if not self._pickup_requested:
@@ -278,8 +321,10 @@ class LootTracker(Configurable):
                 self._latched_target = None
                 self._status = 'Enable auto-pickup to detect sampled loot.'
                 return
-            if self._frame_count % self.MATCH_INTERVAL:
+            now = time.monotonic()
+            if now - self.__dict__.get('_last_scan', float('-inf')) < self.SCAN_INTERVAL:
                 return
+            self._last_scan = now
             loot_templates = self._loot_templates.copy()
             player_template = self._player_template
 
@@ -326,6 +371,7 @@ class LootTracker(Configurable):
                 self._record_loot_miss()
             return
 
+        self._scan_ground_drops(frame, player_bounds)
         (player_left, player_top), (player_right, player_bottom) = player_bounds
         player_x = (player_left + player_right) // 2
         player_y = (player_top + player_bottom) // 2
@@ -432,20 +478,9 @@ class LootTracker(Configurable):
             self._candidate_track = (
                 loot_x, loot_y, track_count, tracked_bobbing
             )
-            if self._latched_target is not None:
-                previous_x, previous_y = self._latched_target
-                same_target = (
-                    abs(target[0] - previous_x) <= max(matched_size[1], 6)
-                    and abs(target[1] - previous_y) <= max(
-                        matched_size[0], self.MAX_BOB_OFFSET * 2
-                    )
-                )
-                if same_target:
-                    self._missed_scans = 0
-                    self._status = 'Loot under the player; pickup already sent.'
-                    return
-                self._latched_target = None
-                self._nearby_frames = 0
+            if time.monotonic() < self.__dict__.get('_cooldown_until', float('-inf')):
+                self._status = 'Loot under the player; pickup just sent.'
+                return
 
             self._missed_scans = 0
             self._nearby_frames = track_count
@@ -459,6 +494,7 @@ class LootTracker(Configurable):
             if confirmed:
                 self._pickup_requested = True
                 self._latched_target = target
+                self._cooldown_until = time.monotonic() + self.PICKUP_COOLDOWN
                 self._nearby_frames = 0
                 self._candidate_track = None
                 motion = 'bobbing loot tracked' if tracked_bobbing else 'loot matched'

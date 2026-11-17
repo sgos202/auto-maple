@@ -11,7 +11,7 @@ from src.modules.health import is_game_focused
 
 class Listener(Configurable):
     DEFAULT_CONFIG = {
-        'Start/stop': 'insert',
+        'Start/stop': 'f3',
         'Reload routine': 'f6',
         'Record position': 'f7'
     }
@@ -48,7 +48,15 @@ class Listener(Configurable):
         while True:
             if self.enabled:
                 if kb.is_pressed(self.config['Start/stop']):
-                    Listener.toggle_enabled()
+                    # 2026-11-15: an unexplained DISABLED at 04:50 had no reason
+                    # printed; log every hotkey press so the cause is visible.
+                    print(f"\n[~] Start/stop key ({self.config['Start/stop'].upper()}) "
+                          f"pressed; game focused: {is_game_focused()}.")
+                    from src.modules import game_restart, mini_games
+                    if game_restart.handle_start_stop():    # mid-restart: call it off
+                        pass
+                    elif not mini_games.handle_start_stop():  # mid-game: resume after, or not
+                        Listener.toggle_enabled()
                     self.wait_for_release('Start/stop')
                 elif kb.is_pressed(self.config['Reload routine']):
                     Listener.reload_routine()
@@ -81,6 +89,11 @@ class Listener(Configurable):
         """Starts or pauses Auto Maple's routine or standalone mode."""
 
         config.bot.rune_active = False
+        try:    # a pause the memory guard made is the user's from here on
+            from src.modules.memory_guard import memory_guard
+            memory_guard.user_toggled()
+        except Exception:
+            pass
 
         if not config.enabled:
             standalone = (

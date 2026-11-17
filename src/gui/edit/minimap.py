@@ -12,10 +12,14 @@ class Minimap(LabelFrame):
 
         self.WIDTH = 400
         self.HEIGHT = 300
-        self.canvas = tk.Canvas(self, bg='black',
-                                width=self.WIDTH, height=self.HEIGHT,
+        # The canvas takes the minimap's own aspect ratio (no bars); WIDTH and
+        # HEIGHT are only the largest it may grow to.
+        self.area = tk.Frame(self, width=self.WIDTH, height=self.HEIGHT)
+        self.area.pack(expand=True, fill='both', padx=5, pady=5)
+        self.area.pack_propagate(False)
+        self.canvas = tk.Canvas(self.area, width=self.WIDTH, height=self.HEIGHT,
                                 borderwidth=0, highlightthickness=0)
-        self.canvas.pack(expand=True, fill='both', padx=5, pady=5)
+        self.canvas.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.container = None
 
         self.draw_default()
@@ -56,12 +60,16 @@ class Minimap(LabelFrame):
         """Returns a copy of IMG resized to fit the Canvas."""
 
         height, width, _ = img.shape
-        ratio = min(self.WIDTH / width, self.HEIGHT / height)
-        new_width = int(width * ratio)
-        new_height = int(height * ratio)
-        if new_height * new_width > 0:
-            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
-        return img
+        if width < 1 or height < 1:
+            return img
+        avail_w, avail_h = self.area.winfo_width(), self.area.winfo_height()
+        if avail_w < 20 or avail_h < 20:            # not laid out yet
+            avail_w, avail_h = self.WIDTH, self.HEIGHT
+        ratio = min(avail_w / width, avail_h / height)
+        new_width = max(1, int(width * ratio))
+        new_height = max(1, int(height * ratio))
+        interpolation = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
+        return cv2.resize(img, (new_width, new_height), interpolation=interpolation)
 
     def draw(self, img):
         """Draws IMG onto the Canvas."""
@@ -69,11 +77,11 @@ class Minimap(LabelFrame):
         if config.layout:
             config.layout.draw(img)     # Display the current Layout
 
+        height, width = img.shape[:2]
+        self.canvas.configure(width=width, height=height)
         img = ImageTk.PhotoImage(Image.fromarray(img))
         if self.container is None:
-            self.container = self.canvas.create_image(self.WIDTH // 2,
-                                                      self.HEIGHT // 2,
-                                                      image=img, anchor=tk.CENTER)
+            self.container = self.canvas.create_image(0, 0, image=img, anchor=tk.NW)
         else:
             self.canvas.itemconfig(self.container, image=img)
         self._img = img                 # Prevent garbage collection

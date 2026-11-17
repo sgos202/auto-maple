@@ -60,8 +60,72 @@ class MobTracker(ttk.Frame):
         self.distance_box.grid(row=2, column=1, sticky=tk.W, pady=(5, 0))
         self.distance_box.bind('<FocusOut>', self._apply_settings)
         self.distance_box.bind('<Return>', self._apply_settings)
-        ttk.Label(self, text='px   Hold attack; 3+ in-range group: Q').grid(
-            row=2, column=2, columnspan=2, sticky=tk.W, pady=(5, 0)
+        ttk.Label(self, text='px   Hold attack').grid(
+            row=2, column=2, sticky=tk.W, pady=(5, 0)
+        )
+        # Off for a character without a group skill: piles are then fought
+        # one enemy at a time and the Pig Beach gather (built on Q) is skipped
+        self.group_skill = tk.BooleanVar(value=self.tracker.group_skill_enabled())
+        ttk.Checkbutton(
+            self,
+            text='Use group skill (Q) on piles',
+            variable=self.group_skill,
+            command=lambda: self.tracker.set_group_skill(self.group_skill.get())
+        ).grid(row=2, column=3, sticky=tk.W, pady=(5, 0))
+
+        # Ranged pull for a magician (Magic Missile): hit an enemy from afar,
+        # let it come, finish it with the melee swing. Off by default and
+        # saved with the profile (a profile without it loads it as off).
+        missile = self.tracker.missile_settings()
+        self.missile = tk.BooleanVar(value=missile['enabled'])
+        self.missile_key = tk.StringVar(value=missile['key'])
+        self.missile_range = tk.StringVar(value=str(missile['range']))
+        ttk.Checkbutton(
+            self,
+            text='Magic missile pulls enemies (magician)',
+            variable=self.missile,
+            command=self._apply_missile
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        missile_row = ttk.Frame(self)
+        missile_row.grid(row=6, column=2, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Label(missile_row, text='Key').pack(side=tk.LEFT)
+        key_box = ttk.Entry(missile_row, textvariable=self.missile_key, width=6)
+        key_box.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(missile_row, text='Max range').pack(side=tk.LEFT)
+        low, high = self.tracker.MISSILE_RANGE_LIMITS
+        range_box = tk.Spinbox(
+            missile_row, from_=low, to=high, increment=10, width=5,
+            textvariable=self.missile_range, command=self._apply_missile
+        )
+        range_box.pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(missile_row, text='px').pack(side=tk.LEFT)
+        for box in (key_box, range_box):
+            box.bind('<FocusOut>', self._apply_missile)
+            box.bind('<Return>', self._apply_missile)
+
+        # Long maps with ramps (Perion Street Corner): sweep end to end, count
+        # enemies up or down a ramp, hold the attack and step in between swings
+        self.sweep = tk.BooleanVar(value=self.tracker.sweep_patrol_enabled())
+        ttk.Checkbutton(
+            self,
+            text='Sweep the map end to end (long map with ramps; hold attack and step in)',
+            variable=self.sweep,
+            command=lambda: self.tracker.set_sweep_patrol(self.sweep.get())
+        ).grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+
+        # Profiles: one saved set of samples + settings per map (snails, pigs, ...)
+        ttk.Label(self, text='Profile').grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
+        self.profile_name = tk.StringVar()
+        self.profile_box = ttk.Combobox(
+            self, textvariable=self.profile_name, width=18,
+            values=self.tracker.profile_names()
+        )
+        self.profile_box.grid(row=5, column=1, sticky=tk.EW, pady=(5, 0), padx=(0, 4))
+        ttk.Button(self, text='Save profile', command=self._save_profile).grid(
+            row=5, column=2, sticky=tk.EW, pady=(5, 0), padx=(0, 4)
+        )
+        ttk.Button(self, text='Load profile', command=self._load_profile).grid(
+            row=5, column=3, sticky=tk.EW, pady=(5, 0)
         )
 
         self.status = tk.StringVar()
@@ -148,17 +212,22 @@ class MobTracker(ttk.Frame):
                 variable=variable,
                 command=self._apply_focus_samples
             ).pack()
-            speed_variable = tk.BooleanVar(
-                value=speed_profiles[index] == 'fast'
-            )
+            # normal: snails, spores | fast: quick walkers | jumper: pigs (hop)
+            speed_variable = tk.StringVar(value=speed_profiles[index])
             self.speed_vars.append(speed_variable)
-            ttk.Checkbutton(
+            speed_box = ttk.Combobox(
                 card,
-                text='Fast / jumping',
-                variable=speed_variable,
-                command=lambda sample_index=index, value=speed_variable:
+                values=self.tracker.SPEED_PROFILES,
+                textvariable=speed_variable,
+                state='readonly',
+                width=7
+            )
+            speed_box.pack()
+            speed_box.bind(
+                '<<ComboboxSelected>>',
+                lambda _event, sample_index=index, value=speed_variable:
                     self._apply_speed_profile(sample_index, value)
-            ).pack()
+            )
 
     def _apply_focus_samples(self):
         self.tracker.set_focused_enemy_samples(
@@ -167,7 +236,7 @@ class MobTracker(ttk.Frame):
         )
 
     def _apply_speed_profile(self, index, variable):
-        profile = 'fast' if variable.get() else 'normal'
+        profile = variable.get()
         try:
             self.tracker.set_enemy_speed_profile(index, profile)
         except ValueError as error:
@@ -177,6 +246,53 @@ class MobTracker(ttk.Frame):
                 parent=self.winfo_toplevel()
             )
             self.refresh_samples()
+
+    def _save_profile(self):
+        name = self.profile_name.get().strip()
+        try:
+            self.tracker.save_profile(name)
+        except (ValueError, OSError) as error:
+            messagebox.showerror(
+                'Could not save profile', str(error), parent=self.winfo_toplevel()
+            )
+            return
+        self.profile_box.configure(values=self.tracker.profile_names())
+        messagebox.showinfo(
+            'Profile saved', f'Saved the current samples and settings as {name!r}.',
+            parent=self.winfo_toplevel()
+        )
+
+    def _load_profile(self):
+        name = self.profile_name.get().strip()
+        try:
+            self.tracker.load_profile(name)
+        except (ValueError, OSError) as error:
+            messagebox.showerror(
+                'Could not load profile', str(error), parent=self.winfo_toplevel()
+            )
+            return
+        self.profile_box.configure(values=self.tracker.profile_names())
+        current = self.tracker.settings()
+        self.distance.set(str(current['Range']))
+        self.group_skill.set(self.tracker.group_skill_enabled())
+        self.sweep.set(self.tracker.sweep_patrol_enabled())
+        self._show_missile()
+        self.refresh_samples()
+
+    def _show_missile(self):
+        missile = self.tracker.missile_settings()
+        self.missile.set(missile['enabled'])
+        self.missile_key.set(missile['key'])
+        self.missile_range.set(str(missile['range']))
+
+    def _apply_missile(self, _event=None):
+        try:
+            self.tracker.set_missile(
+                self.missile.get(), self.missile_key.get(), self.missile_range.get())
+        except ValueError as error:
+            messagebox.showerror(
+                'Magic missile', str(error), parent=self.winfo_toplevel())
+            self._show_missile()
 
     def _apply_settings(self, _event=None):
         try:

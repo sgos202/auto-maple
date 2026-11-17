@@ -12,12 +12,17 @@ RESOURCES_DIR = 'resources'
 #################################
 # The player's position relative to the minimap
 player_pos = (0, 0)
+player_pos_time = 0.0     # time.monotonic() of the last minimap fix
 
 # Describes whether the main bot loop is currently running or not
 enabled = False
 
 # If there is another player in the map, Auto Maple will purposely make random human-like mistakes
 stage_fright = False
+
+# time.monotonic() until which a black loading screen is expected (a channel
+# change); the notifier must not take it for a disconnect
+map_transition_until = 0.0
 
 # Represents the current shortest path that the bot is taking
 path = []

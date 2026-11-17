@@ -10,13 +10,27 @@ class Minimap(LabelFrame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, 'Minimap', **kwargs)
 
-        self.WIDTH = 220
+        # Upper bounds only: the canvas is resized to the minimap's own aspect
+        # ratio every frame, so flat, tall or square maps fill it without bars.
+        self.WIDTH = 270
         self.HEIGHT = 150
-        self.canvas = tk.Canvas(self, bg='black',
-                                width=self.WIDTH, height=self.HEIGHT,
+        self.area = tk.Frame(self, width=self.WIDTH, height=self.HEIGHT)
+        self.area.pack(expand=True, fill='both', padx=5, pady=5)
+        self.area.pack_propagate(False)
+        self.canvas = tk.Canvas(self.area, width=self.WIDTH, height=self.HEIGHT,
                                 borderwidth=0, highlightthickness=0)
-        self.canvas.pack(expand=True, fill='both', padx=5, pady=5)
+        self.canvas.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.container = None
+        self._canvas_size = None
+
+    def _fit(self, width, height):
+        """The largest size with the minimap's aspect ratio that fits the panel."""
+        avail_w = self.area.winfo_width()
+        avail_h = self.area.winfo_height()
+        if avail_w < 20 or avail_h < 20:            # not laid out yet
+            avail_w, avail_h = self.WIDTH, self.HEIGHT
+        ratio = min(avail_w / width, avail_h / height)
+        return max(1, int(width * ratio)), max(1, int(height * ratio))
 
     def display_minimap(self):
         """Updates the Main page with the current minimap."""
@@ -31,12 +45,19 @@ class Minimap(LabelFrame):
             img = cv2.cvtColor(minimap['minimap'], cv2.COLOR_BGR2RGB)
             height, width, _ = img.shape
 
-            # Resize minimap to fit the Canvas
-            ratio = min(self.WIDTH / width, self.HEIGHT / height)
-            new_width = int(width * ratio)
-            new_height = int(height * ratio)
-            if new_height * new_width > 0:
-                img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            if width < 1 or height < 1:
+                return
+
+            # Scale the minimap to fill the panel while keeping its shape, and
+            # size the canvas to match so there are no bars around it.
+            new_width, new_height = self._fit(width, height)
+            interpolation = cv2.INTER_AREA if new_width < width else cv2.INTER_LINEAR
+            img = cv2.resize(img, (new_width, new_height), interpolation=interpolation)
+            if self._canvas_size != (new_width, new_height):
+                self.canvas.configure(width=new_width, height=new_height)
+                if self.container is not None:
+                    self.canvas.coords(self.container, 0, 0)
+                self._canvas_size = (new_width, new_height)
 
             # Mark the position of the active rune
             if rune_active:
@@ -74,9 +95,7 @@ class Minimap(LabelFrame):
             # Display the minimap in the Canvas
             img = ImageTk.PhotoImage(Image.fromarray(img))
             if self.container is None:
-                self.container = self.canvas.create_image(self.WIDTH // 2,
-                                                          self.HEIGHT // 2,
-                                                          image=img, anchor=tk.CENTER)
+                self.container = self.canvas.create_image(0, 0, image=img, anchor=tk.NW)
             else:
                 self.canvas.itemconfig(self.container, image=img)
             self._img = img                 # Prevent garbage collection
