@@ -6,6 +6,7 @@ from tkinter import ttk
 from src.common.output import output_capture
 from src.common import vkeys
 from src.gui.interfaces import Tab
+from src.modules.mini_games import TALLY
 
 
 class Log(Tab):
@@ -22,6 +23,11 @@ class Log(Tab):
         self.output.grid(row=0, column=0, sticky=tk.NSEW, padx=(8, 0), pady=8)
         self.scrollbar.grid(row=0, column=1, sticky=tk.NS, padx=(0, 8), pady=8)
         self.output.tag_configure('stderr', foreground='#b00020')
+
+        self.mini_games = tk.StringVar(value=TALLY.summary())
+        ttk.Label(self, textvariable=self.mini_games, font=('', 9, 'bold')).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 6)
+        )
 
         self.key_status = tk.StringVar(value='')
         ttk.Label(self, textvariable=self.key_status).grid(
@@ -43,6 +49,8 @@ class Log(Tab):
             f'Input overlay — held: {held_text}  |  last: {last_event} '
             '|  SendInput request only; game receipt is not verified.'
         )
+
+        self.mini_games.set(TALLY.summary())
 
         events = output_capture.drain()
         if events:

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import tensorflow as tf
 
 from src.common import utils
 
@@ -32,6 +31,10 @@ def load_model():
             'SavedModel is incomplete; missing required file(s): '
             + ', '.join(missing_files)
         )
+    # TensorFlow holds ~220 MB once imported: only load it when there is a
+    # complete model for it to run (it used to be imported even when the rune
+    # solver was disabled for a missing model file).
+    import tensorflow as tf
     return tf.saved_model.load(str(MODEL_DIR))
 
 
@@ -75,6 +78,7 @@ def run_inference_for_single_image(model, image):
 
     image = np.asarray(image)
 
+    import tensorflow as tf
     input_tensor = tf.convert_to_tensor(image)
     input_tensor = input_tensor[tf.newaxis,...]
 

@@ -6,3 +6,16 @@ runs/violetta/
 .idea/
 .settings/
 *.iml
+
+# Local-only: environment, run output, debug recordings, backups, large downloads
+venv/
+logs/
+models/
+tools/LLMHREmover/
+*.bak_*
+*.wip_*
+*.mp4
+*.csv
+nexon_updater_*.log
+assets/shape_training/
+assets/maps/pig_beach/rope_positions.png

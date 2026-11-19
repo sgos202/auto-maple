@@ -77,6 +77,13 @@ def screenshot():
                 frame = np.asarray(screen.grab(region))[:, :, :3]
         except Exception:
             return None
+    return encode(frame)
+
+
+def encode(frame):
+    """A BGR frame as JPEG bytes for Telegram (shrunk to MAX_WIDTH); None on failure."""
+    import cv2
+    import numpy as np
     frame = np.ascontiguousarray(frame[:, :, :3])
     if frame.shape[1] > MAX_WIDTH:
         frame = cv2.resize(frame, None, fx=MAX_WIDTH / frame.shape[1],
@@ -85,14 +92,14 @@ def screenshot():
     return jpeg.tobytes() if ok else None
 
 
-def send(text, photo=False):
-    """Queues TEXT (with a screenshot taken now if PHOTO) for your phone.
-    Does nothing when Telegram isn't set up. Never blocks or raises."""
+def send(text, photo=False, frame=None):
+    """Queues TEXT (with a screenshot taken now if PHOTO, or the BGR image FRAME)
+    for your phone. Does nothing when Telegram isn't set up. Never blocks or raises."""
     global _thread
     if not enabled():
         return
     try:
-        image = screenshot() if photo else None
+        image = encode(frame) if frame is not None else screenshot() if photo else None
         _queue.put_nowait((text, image))
     except queue.Full:
         return
@@ -158,7 +165,8 @@ def setup(token):
     chat = chats[-1]
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     _settings = {'token': token, 'chat_id': chat['id'], 'enabled': True,
-                 'mini_game_start': True, 'mini_game_end': True, 'bot_paused': True}
+                 'mini_game_start': True, 'mini_game_end': True, 'bot_paused': True,
+                 'quiz_answer': True}
     with open(SETTINGS, 'w', encoding='utf-8') as file:
         json.dump(_settings, file, indent=2)
     who = chat.get('first_name') or chat.get('title') or 'you'
@@ -177,7 +185,8 @@ def test():
 
 
 def wants(kind):
-    """Whether alerts of KIND ('mini_game_start', 'mini_game_end', 'bot_paused') are on."""
+    """Whether alerts of KIND ('mini_game_start', 'mini_game_end', 'bot_paused',
+    'quiz_answer') are on. A kind missing from the settings counts as on."""
     return enabled() and _load().get(kind, True)
 
 

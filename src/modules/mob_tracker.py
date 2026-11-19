@@ -41,7 +41,15 @@ class MobTracker(Configurable):
         # to end clearing what is ahead, treat enemies up or down a ramp as on
         # the character's level, keep the attack held and step in between
         # swings. Off unless ticked (a settings file without it loads as off).
-        'Sweep patrol': False
+        'Sweep patrol': False,
+        # Maps with drops that land up on scenery at the map's ends (the hay
+        # bales left and right on the Henesys snail map, msg-boc.png): with
+        # nothing to fight, the patrol jumps up where its walk stops and taps
+        # loot before it turns. Off unless ticked.
+        'Edge loot jumps': False,
+        # Patrol with nothing in sight: hops now and then, short stops, legs
+        # of different lengths, instead of the same walk every lap.
+        'Idle variety': False
     }
     MISSILE_RANGE_LIMITS = (100, 400)
     TEMPLATE_DIRECTORY = '.settings'
@@ -77,7 +85,6 @@ class MobTracker(Configurable):
     # A locked enemy that vanishes is most often dead, not hidden: keep swinging at
     # its last spot only this long, then just wait out the rest of the grace period.
     HIDDEN_ATTACK_SECONDS = 0.4
-    DEAD_HEALTH_RATIO = 0.02    # an HP bar this empty belongs to a dying enemy
     LOW_HEALTH_RATIO = 0.15     # a locked enemy this low that vanishes was killed
     # A sample whose enemy could not be cut out is matched through an oval that still
     # holds some scenery; such a sample needs this much more score to count.
@@ -668,6 +675,24 @@ class MobTracker(Configurable):
             self._release_lock_locked()
             self.save_config()
 
+    def edge_loot_enabled(self):
+        with self._lock:
+            return self.config.get('Edge loot jumps') is True
+
+    def set_edge_loot(self, enabled):
+        with self._lock:
+            self.config['Edge loot jumps'] = bool(enabled)
+            self.save_config()
+
+    def idle_variety_enabled(self):
+        with self._lock:
+            return self.config.get('Idle variety') is True
+
+    def set_idle_variety(self, enabled):
+        with self._lock:
+            self.config['Idle variety'] = bool(enabled)
+            self.save_config()
+
     def _on_slope(self, item, player_x, ground_y):
         """ITEM moved onto the character's ground line when a ramp between the
         two explains its height (so everything after treats it as on this
@@ -848,10 +873,13 @@ class MobTracker(Configurable):
             pickle.dump(settings, file)
         return path
 
-    def load_profile(self, name):
+    def load_profile(self, name, preserve_player_badge=False):
         """
         Makes a saved profile the active one. The active samples are first saved to
         the '_autosave' profile, so loading never loses an unsaved calibration.
+        Map-specific loads can preserve the active character's player badge.
+
+        :param preserve_player_badge: leave the current character badge in place.
         """
         path = self._profile_path(name)
         settings_path = os.path.join(path, 'mob_tracker')
@@ -863,7 +891,9 @@ class MobTracker(Configurable):
             count = max(1, int(loaded.get('Enemy count') or 1))
         except (TypeError, ValueError):
             count = 1
-        file_names = [os.path.basename(self.PLAYER_TEMPLATE_PATH)] + [
+        player_badge = os.path.basename(self.PLAYER_TEMPLATE_PATH)
+        preserve_badge = preserve_player_badge
+        file_names = ([] if preserve_badge else [player_badge]) + [
             os.path.basename(self._mob_template_path(index)) for index in range(count)
         ]
         missing = [
@@ -1600,6 +1630,50 @@ class MobTracker(Configurable):
         if 1500 <= sample <= 20000:
             known = self.__dict__.get('_ppm_est')
             self._ppm_est = sample if known is None else 0.7 * known + 0.3 * sample
+
+    # A Split Road (2-point.mp4, 2026-11-19): the snail up on the cliff past
+    # the right end point (and the NPC on the platform above) counted as
+    # enemies 300-500 px away. The bot walked at them, hit the map limit,
+    # turned, saw them again (6 turns in 3 s, over and over), and the
+    # platform never counted as cleared. Past a map limit = not farmed here.
+    # The thing it kept walking at was the wooden signpost on the low ground
+    # just past the right end (x ~0.207, read 0.203-0.212), matching a
+    # mushroom sample; one minimap px is 0.004 there.
+    LIMIT_MARGIN = 0.004            # minimap units
+    # MapleStory minimaps are 1:16: 2-point.mp4 measured 15.97 screen px per
+    # minimap px with the camera clamped (the snail map's 4100/unit fits too)
+    MINIMAP_SCALE = 16.0
+
+    def _limit_scale(self):
+        """Screen px per minimap unit, from the minimap's width (else the estimate)."""
+        capture = getattr(_config, 'capture', None)
+        minimap = (getattr(capture, 'minimap', None) or {}).get('minimap')
+        width = getattr(minimap, 'shape', (0, 0))[1] if minimap is not None else 0
+        return self.MINIMAP_SCALE * width if width >= 50 else self._px_per_minimap()
+
+    def _inside_map_limits(self, candidates, player_x):
+        """CANDIDATES minus those standing past the map profile's limits (an
+        HP bar shows it is a real, hurt enemy: always kept)."""
+        bot = getattr(_config, 'bot', None)
+        manager = getattr(bot, '__dict__', {}).get('map_events')
+        limits = manager.limits() if manager is not None else {}
+        if not limits:
+            return candidates
+        pos = getattr(_config, 'player_pos', None)
+        when = getattr(_config, 'player_pos_time', 0.0) or 0.0
+        if not pos or tuple(pos) == (0, 0) or abs(time.monotonic() - when) > 0.5:
+            return candidates
+        scale = self._limit_scale()
+        left, right = limits.get('left'), limits.get('right')
+        kept = []
+        for item in candidates:
+            world = pos[0] + (item[1] - player_x) / scale
+            if item[3] is None and (
+                    (right is not None and world > right + self.LIMIT_MARGIN)
+                    or (left is not None and world < left - self.LIMIT_MARGIN)):
+                continue
+            kept.append(item)
+        return kept
 
     def _world_x(self, screen_x, player_x):
         """Minimap x of a screen x, or None while the minimap fix is stale."""
@@ -2435,10 +2509,10 @@ class MobTracker(Configurable):
         # 'jumper' samples each matched enemy claims one bar only.
         stacking = 'jumper' in speed_profiles
         claimed = set()
+        # (An all-black bar is still a live enemy on its last HP: the game takes
+        # the bar away the moment an enemy dies, so any bar on screen, however
+        # empty, means it is still there to hit.)
         for bar_x, bar_y, ratio in sorted(health_bars, key=lambda bar: bar[1]):
-            if ratio <= self.DEAD_HEALTH_RATIO and (
-                    stacking or abs(bar_x - player_x) > self.NORMAL_EARLY_MAX):
-                continue    # an empty bar: that enemy is dying, nothing to attack
             owners = [
                 index for index, item in enumerate(candidates)
                 if abs(item[5] + item[4][0] + item[2].shape[1] // 2 - bar_x)
@@ -2538,15 +2612,10 @@ class MobTracker(Configurable):
                 )[2]
             else:
                 health_ratio = self._health_bar_ratio(frame, mob_bounds)
-            # (Slow walkers close by are kept: a snail or shroom has so few HP
-            # that one swing leaves its bar reading empty while it lives on and
-            # bites - knock-back-dmg-2.mp4. Swinging at a real death animation
-            # for half a second costs nothing.)
-            slow = (template_index >= len(speed_profiles)
-                    or speed_profiles[template_index] == 'normal')
-            if (health_ratio is not None and health_ratio <= self.DEAD_HEALTH_RATIO
-                    and not (slow and abs(mob_x - player_x) <= self.NORMAL_EARLY_MAX)):
-                continue    # its death animation still matches the sample
+            # (An empty, all-black bar is not a dead enemy but one on its last
+            # 1 HP that lives on and bites - knock-back-dmg-2.mp4. It used to be
+            # dropped as "dying" and left alive. A dead enemy's bar is taken away
+            # by the game, so an enemy is let go only once no bar shows at all.)
             positioned_candidates.append((
                 candidate, mob_x, mob_y, health_ratio
             ))
@@ -2602,6 +2671,9 @@ class MobTracker(Configurable):
                 if item[3] is not None
                 or not self._on_ignored_spot(item, ignored_spots, player_x)
             ]
+
+        if 'jumper' not in speed_profiles:
+            positioned_candidates = self._inside_map_limits(positioned_candidates, player_x)
 
         with self._lock:
             blocked_side = self.__dict__.get('_blocked_side')
@@ -2698,8 +2770,8 @@ class MobTracker(Configurable):
                 self._target_waiting = False
                 self._status = (
                     'Player found; only enemies out of reach (raised step or '
-                    'past a wall) or dying ones in view.'
-                    if unreachable else 'Player found; only dying enemies in view.'
+                    'past a wall) or scenery in view.'
+                    if unreachable else 'Player found; only scenery in view.'
                 )
             return
 

@@ -17,6 +17,8 @@ follows on its own thread:
   pictures live in assets/quiz_items/).
   Or a yes/no question, "Is there a spear here?" / "Is this a wand?": click the
   O (yes) or the X (no), then CONFIRM.
+  Any other question goes to a Claude vision model, which says what to click
+  (src/detection/quiz_ai.py; off until set up with --setup KEY).
 
 While a game runs the bot is paused so it doesn't press keys, and it is resumed
 afterwards by itself if it was running before. Pressing Start/stop during a game
@@ -43,7 +45,12 @@ AUTO_SOLVE = {
     'pop-up-3': True,       # "Click all X's" letter quiz
 }
 GAME_WINDOW_TITLE = 'MapleStory'
-SHAPE_START_DELAY = 3.0     # seconds after pop-up-1 before looking for the white figure
+# Seconds after pop-up-1 before looking for the game. 0: the window finder already
+# ignores the 'will start soon' notice (it needs the brown play area under the title
+# bar). 2026-11-19 01:24 the notice was missed and pop-up-1 matched the game itself at
+# countdown '2'; the old 3 s wait swallowed the ~2.5 s white phase, the bot never
+# locked on and the character was jailed (shape-20261119-012428).
+SHAPE_START_DELAY = 0.0
 SHOW_OVERLAY = True         # draw the solvers' tracking boxes over the game
 VIOLETTA_RECORD_DIR = 'logs/violetta'   # what the solver saw, for replaying; None to disable
 LETTER_QUIZ_RECORD_DIR = 'logs/letter_quiz'  # screenshot of each answer; None to disable
@@ -77,7 +84,8 @@ def _violetta_game(stop):
 def _letter_quiz(stop):
     from src.detection import letter_quiz
     return letter_quiz.play_live(GAME_WINDOW_TITLE, select=True, timeout=60.0, stop=stop,
-                                 record_dir=LETTER_QUIZ_RECORD_DIR, overlay=SHOW_OVERLAY)
+                                 record_dir=LETTER_QUIZ_RECORD_DIR, overlay=SHOW_OVERLAY,
+                                 phone=True)
 
 
 GAMES = {
@@ -85,6 +93,58 @@ GAMES = {
     'pop-up-2': ('Violetta', _violetta_game),
     'pop-up-3': ('Letter quiz', _letter_quiz),
 }
+
+
+# 2026-11-18 19:53: a shape game failed while other heavy work ran on this PC
+# (16-32 busy threads): the solver fell to 7.7 frames a second (40-50
+# normally), its mouse trailed the moving figure by 50-160 px and the
+# character was sent to the jail room. While a game is played the bot (and the
+# Violetta tracker's process) run above normal priority so background load
+# can't starve them. Not HIGH: the game client must keep drawing too.
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+_PROCESS_SET_INFORMATION = 0x0200
+_PROCESS_QUERY_INFORMATION = 0x0400
+
+
+def _set_priority(priority, pid=None):
+    """Sets a process's priority class; returns the old one (None on failure)."""
+    import ctypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetPriorityClass.argtypes = [ctypes.c_void_p]
+    kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    if pid is None:
+        handle, opened = kernel32.GetCurrentProcess(), False
+    else:
+        handle = kernel32.OpenProcess(
+            _PROCESS_SET_INFORMATION | _PROCESS_QUERY_INFORMATION, False, pid)
+        opened = True
+        if not handle:
+            return None
+    try:
+        old = kernel32.GetPriorityClass(handle)
+        if not old or not kernel32.SetPriorityClass(handle, priority):
+            return None
+        return old
+    finally:
+        if opened:
+            kernel32.CloseHandle(handle)
+
+
+class _Priority:
+    """Above normal priority for this process while a game runs (the Violetta
+    tracker's server process is started above normal by itself)."""
+
+    def __enter__(self):
+        self.old = _set_priority(ABOVE_NORMAL_PRIORITY_CLASS)
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            _set_priority(self.old)
+        return False
 
 
 def _machine_lock():
@@ -242,8 +302,14 @@ class MiniGameRunner:
         if was_enabled:
             print('[~] The routine resumes by itself afterwards - no need to press Start/stop.')
         if phone_alert.wants('mini_game_start'):
-            phone_alert.send(f'🎮 {name} mini-game started - solving it automatically.',
-                             photo=True)
+            if prefix == 'pop-up-3' and phone_alert.wants('quiz_answer'):
+                # The countdown screen says nothing; the screenshot comes once
+                # the question opens, with the answer drawn on it.
+                phone_alert.send(f'🎮 {name} coming - waiting for the question; '
+                                 f'the answer screenshot follows.')
+            else:
+                phone_alert.send(f'🎮 {name} mini-game started - solving it automatically.',
+                                 photo=True)
         started = time.time()
         result = 'error'
         lock = _machine_lock()
@@ -256,7 +322,8 @@ class MiniGameRunner:
                       f'mini-game; this one is staying out of it. Close the extra one.')
                 self.stop_event.wait(30)    # stay paused while the other one plays
             else:
-                result = game(self.stop_event)
+                with _Priority():
+                    result = game(self.stop_event)
         except Exception:
             print(f'\n[!] {name} mini-game solver failed:')
             traceback.print_exc()

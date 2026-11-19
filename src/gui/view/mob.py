@@ -113,6 +113,23 @@ class MobTracker(ttk.Frame):
             command=lambda: self.tracker.set_sweep_patrol(self.sweep.get())
         ).grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
 
+        # Drops on scenery at the map's ends (hay bales), and a less regular
+        # patrol when nothing is in sight. Both saved with the profile.
+        self.edge_loot = tk.BooleanVar(value=self.tracker.edge_loot_enabled())
+        ttk.Checkbutton(
+            self,
+            text='Jump for loot where the patrol turns (drops on hay bales at the ends)',
+            variable=self.edge_loot,
+            command=lambda: self.tracker.set_edge_loot(self.edge_loot.get())
+        ).grid(row=8, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        self.idle_variety = tk.BooleanVar(value=self.tracker.idle_variety_enabled())
+        ttk.Checkbutton(
+            self,
+            text='Vary idle patrol (random hops, short stops, different turn points)',
+            variable=self.idle_variety,
+            command=lambda: self.tracker.set_idle_variety(self.idle_variety.get())
+        ).grid(row=9, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+
         # Profiles: one saved set of samples + settings per map (snails, pigs, ...)
         ttk.Label(self, text='Profile').grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
         self.profile_name = tk.StringVar()
@@ -276,6 +293,8 @@ class MobTracker(ttk.Frame):
         self.distance.set(str(current['Range']))
         self.group_skill.set(self.tracker.group_skill_enabled())
         self.sweep.set(self.tracker.sweep_patrol_enabled())
+        self.edge_loot.set(self.tracker.edge_loot_enabled())
+        self.idle_variety.set(self.tracker.idle_variety_enabled())
         self._show_missile()
         self.refresh_samples()
 

@@ -62,6 +62,14 @@ MANUAL_OVERRIDE_WINDOW = 15.0
 # (a new map has a minimap of another size).
 RECHECK_SECONDS = 2.0
 MARKER_LOST_SECONDS = 3.0
+# The old corner pictures are only a fallback for when the white outline can't
+# be seen. A mouse pointer resting on the minimap hides the outline, and the
+# corners then matched the inventory window beside it: 262 px wide for a 211 px
+# map (run-20261118-170231, fall_recovery.mp4), so every position read ~16%
+# short and the bot walked off the pig island. So the outline gets this long
+# first, and while running on corners it keeps being looked for and replaces them.
+CORNER_FALLBACK_AFTER = 3.0
+OUTLINE_SLACK = 3           # px an outline may differ by before it counts as moved
 
 
 def locate_player(frame, mm_tl, mm_br, template=None, pad=MINIMAP_EDGE_PAD):
@@ -269,6 +277,7 @@ class Capture:
         mss.windows.CAPTUREBLT = 0
         last_calibration_warning = None
         failing_since = None
+        outline_missing_since = None
         while not self._stale(generation):
             watchdog.heartbeat('capture')
             # Calibrate screen capture
@@ -296,6 +305,10 @@ class Capture:
             by_hand = manual_requested and (
                 time.monotonic() - self.found_automatically_at < MANUAL_OVERRIDE_WINDOW)
             outline = None if by_hand else self.find_outline(self.frame)
+            if outline is None:
+                outline_missing_since = outline_missing_since or time.monotonic()
+            else:
+                outline_missing_since = None
             manual_calibration = False
             if outline is not None:
                 automatic_match_failed = False
@@ -367,6 +380,9 @@ class Capture:
                 continue
             elif outline is not None:
                 mm_tl, mm_br = outline
+            elif time.monotonic() - outline_missing_since < CORNER_FALLBACK_AFTER:
+                time.sleep(0.5)     # give the outline a moment (a passing mouse pointer)
+                continue
             else:
                 mm_tl = (
                     tl[0] + MINIMAP_BOTTOM_BORDER,
@@ -386,8 +402,13 @@ class Capture:
                 time.sleep(0.5)
                 continue
 
+            by_corners = not manual_calibration and outline is None
             if manual_calibration:
                 print('\n[~] Minimap calibrated using the selected area.')
+            elif by_corners:
+                print(f'\n[~] Minimap found from its corner pictures (outline not visible): '
+                      f'{mm_br[0] - mm_tl[0]}x{mm_br[1] - mm_tl[1]} px at {mm_tl}. '
+                      'Still looking for its outline, which is more exact.')
             elif outline is not None:
                 self.found_automatically_at = time.monotonic()
                 print(f'\n[~] Minimap found automatically: {mm_br[0] - mm_tl[0]}x'
@@ -411,7 +432,7 @@ class Capture:
                         last_recheck = now
                         if self._needs_recalibration(
                                 window_rect, (mm_tl, mm_br), manual_calibration,
-                                now - last_seen >= MARKER_LOST_SECONDS):
+                                now - last_seen >= MARKER_LOST_SECONDS, by_corners):
                             self.calibrated = False
                             break
 
@@ -441,11 +462,14 @@ class Capture:
 
                     time.sleep(0.001)
 
-    def _needs_recalibration(self, window_rect, area, drawn_by_hand, marker_lost):
+    def _needs_recalibration(self, window_rect, area, drawn_by_hand, marker_lost,
+                             by_corners=False):
         """True when the minimap has to be found again: the game window moved,
         was resized or is a new one (the game was restarted), or the player's
         marker is gone and the minimap now sits elsewhere or has another size
-        (a new map). An area drawn by hand is only dropped for a window change."""
+        (a new map), or the area came from the corner pictures and the outline
+        now shows a different one. An area drawn by hand is only dropped for a
+        window change."""
         try:
             handle, rect = self.game_window_rect()
         except Exception:
@@ -454,11 +478,22 @@ class Capture:
             if handle:
                 print('\n[~] The game window moved or is a new one; finding the minimap again.')
             return True
-        if not marker_lost or drawn_by_hand or self.frame is None:
+        if drawn_by_hand or self.frame is None:
             return False
+        # Checked even with the marker in sight: a minimap that shrank (its -/+
+        # buttons, a new map) can still hold the marker inside the old, larger
+        # area, and every position read from it is then off.
         outline = self.find_outline(self.frame)
-        if outline is not None and tuple(outline) != tuple(area):
-            print('\n[~] The minimap changed (a new map?); finding it again.')
+        differs = outline is not None and max(
+            abs(a - b) for p, q in zip(outline, area) for a, b in zip(p, q)) > OUTLINE_SLACK
+        if differs:
+            if by_corners:
+                why = 'its outline is visible now and differs from the corner-picture guess'
+            elif marker_lost:
+                why = 'a new map?'
+            else:
+                why = f'now {outline[1][0] - outline[0][0]}x{outline[1][1] - outline[0][1]} px'
+            print(f'\n[~] The minimap changed ({why}); finding it again.')
             return True
         return False
 

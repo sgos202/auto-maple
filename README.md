@@ -176,6 +176,14 @@ python -m src.detection.violetta_yolo_poc export --dataset "assets\violetta_trai
 
 <p>Auto Maple also watches for the Lie Detector mini-game's “The mini-game will start soon” prompt in the lower-right of the MapleStory window and plays a Windows alert sound once per appearance. This monitor runs even while Auto Maple is paused and does not control the character or interact with the prompt.</p>
 
+<h2>Letter quiz ("Click all X's")</h2>
+
+<p>When the “Question in 11 seconds / Answer within 10 seconds” pop-up (pop-up-3) appears, Auto Maple pauses the routine and waits for the quiz that follows. It reads the target letter and count from the title, finds the letter tiles under it, picks the tiles that match, clicks them and then clicks CONFIRM. Each answer is saved to <code>logs/letter_quiz/</code> (a screenshot plus an annotated copy) so a wrong pick can be checked. Turn it off with <code>AUTO_SOLVE['pop-up-3']</code> in <code>src/modules/mini_games.py</code>.</p>
+
+<pre><code>python -m src.detection.letter_quiz assets\pop-up-3-quiz.png --output answer.png   # check a screenshot
+python -m src.detection.letter_quiz            # watch the game, preview only
+python -m src.detection.letter_quiz --select   # watch the game and click</code></pre>
+
 
 <br>
 

@@ -90,5 +90,47 @@ class PopUpAnchorDetectorTests(unittest.TestCase):
                 self.assertFalse(detector.detect(self._frame_with(f"assets/{other}.png")))
 
 
+class SeeThroughPopUpTests(unittest.TestCase):
+    """pop-up-3 is drawn see-through over the game: only its white text is matched."""
+
+    SCALES = tuple(round(0.8 + 0.05 * i, 2) for i in range(10))
+
+    def setUp(self):
+        anchors = [cv2.imread(p) for p in sorted(glob.glob("assets/pop_up_anchors/pop-up-3_*.png"))]
+        self.assertTrue(anchors)
+        self.detector = PopUpAnchorDetector(anchors, threshold=0.70, scales=self.SCALES,
+                                            downscale=0.5, white_text=True)
+        self.popup = cv2.imread("assets/pop-up-3.png")
+
+    def _scene(self, seed):
+        rng = np.random.default_rng(seed)
+        noise = rng.integers(0, 256, (48, 86, 3), dtype=np.uint8)
+        return cv2.resize(noise, (1366, 768), interpolation=cv2.INTER_CUBIC)     # blobby "game"
+
+    def _with_text(self, scene, scale):
+        """The pop-up's text drawn over a darkened SCENE, as the game does it."""
+        panel = cv2.resize(self.popup[95:175, 160:455], None, fx=scale, fy=scale)
+        text = cv2.inRange(cv2.cvtColor(panel, cv2.COLOR_BGR2HSV), (0, 0, 200), (180, 50, 255)) > 0
+        h, w = panel.shape[:2]
+        frame = scene.copy()
+        area = frame[300:300 + h, 500:500 + w].astype(np.float32) * 0.55 + np.array((120, 60, 30)) * 0.45
+        area[text] = 255
+        frame[300:300 + h, 500:500 + w] = area.astype(np.uint8)
+        return frame
+
+    def test_detects_text_over_any_background_and_size(self):
+        for seed in range(3):
+            for scale in (0.85, 1.0, 1.2):
+                with self.subTest(seed=seed, scale=scale):
+                    self.assertTrue(self.detector.detect(self._with_text(self._scene(seed), scale)))
+        self.assertTrue(self.detector.detect(self.popup))
+
+    def test_ignores_plain_game_and_other_pop_ups(self):
+        for seed in range(3):
+            self.assertFalse(self.detector.detect(self._scene(seed)))
+        for other in ("assets/pop-up-1.png", "assets/pop-up-2.png"):
+            self.assertFalse(self.detector.detect(cv2.imread(other)))
+
+
 if __name__ == "__main__":
     unittest.main()

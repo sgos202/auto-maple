@@ -53,6 +53,19 @@ class Status(LabelFrame):
         self.restart_button.keep_enabled = True
         self.restart_button.grid(row=5, column=0, columnspan=2, padx=5, pady=(0, 5),
                                  sticky=tk.EW)
+        # Which map this is, for its spots and events (map_events.py). Maps
+        # without a minimap title crop (A Split Road) are only known this way.
+        from src.modules.map_events import MAPS
+        auto = 'Recognise automatically'
+        names = [auto] + [m.name for m in MAPS]
+        chosen = channel_settings.chosen_map()
+        self.map_choice = tk.StringVar(value=chosen if chosen in names else auto)
+        tk.Label(self, text='Map:').grid(row=6, column=0, padx=5, pady=(0, 5), sticky=tk.E)
+        self.map_menu = tk.OptionMenu(
+            self, self.map_choice, *names,
+            command=lambda name: channel_settings.set_chosen_map('' if name == auto else name))
+        self.map_menu.keep_enabled = True
+        self.map_menu.grid(row=6, column=1, padx=(0, 5), pady=(0, 5), sticky=tk.EW)
         self._refresh_app_state()
 
     def _restart_game(self):

@@ -49,17 +49,28 @@ class ViolettaTracker:
         box_height = round(height * self.INITIAL_HEIGHT)
         x = round(width * self.SLOT_CENTERS[slot_index] - box_width / 2)
         y = round(height * self.INITIAL_Y)
-        self.width = float(box_width)
-        self.height = float(box_height)
-        self.center = np.array(
-            (x + box_width / 2, y + box_height / 2), dtype=np.float32
-        )
+        self._initialize_box(frame, (x, y, x + box_width, y + box_height))
+
+    @classmethod
+    def from_box(cls, frame, box):
+        tracker = cls.__new__(cls)
+        tracker._initialize_box(frame, box)
+        return tracker
+
+    def _initialize_box(self, frame, box):
+        if len(box) != 4:
+            raise ValueError("A tracking box must contain left, top, right, and bottom.")
+        x0, y0, x1, y1 = map(float, box)
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("A tracking box must have positive width and height.")
+        self.width = x1 - x0
+        self.height = y1 - y0
+        self.center = np.array(((x0 + x1) / 2, (y0 + y1) / 2), dtype=np.float32)
         self._previous_gray = self._gray(frame)
         self._points = self._find_points(self._previous_gray, frame)
         if self._points is None or len(self._points) < self.MIN_FEATURES:
             raise ValueError(
-                "Could not find enough visual features on the make-up Violetta. "
-                "Start tracking while the four Violettas are visible."
+                "Could not find enough visual features in the target box."
             )
         self.confidence = 1.0
         self.visible = True
@@ -411,10 +422,9 @@ def _click_answer(region, answer_index):
         region["width"] * ViolettaTracker.SLOT_CENTERS[answer_index]
     )
     y = region["top"] + round(region["height"] * 0.845)
-    if not user32.SetCursorPos(x, y):
-        raise ctypes.WinError()
-    user32.mouse_event(0x0002, x, y, 0, 0)
-    user32.mouse_event(0x0004, x, y, 0, 0)
+    from src.common import vkeys
+    vkeys.move_cursor(x, y, strict=True)
+    vkeys.click(None, allow_paused=True)
 
 
 def _video(video_path, output_path):

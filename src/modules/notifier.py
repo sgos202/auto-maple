@@ -2,7 +2,8 @@
 
 from src.common import config, utils
 from src.detection.mini_game_alert import PopUpAnchorDetector, RisingEdgeAlert
-from src.modules.mini_games import MiniGameRunner
+from src.modules.mini_games import AUTO_SOLVE, GAMES, MiniGameRunner, TALLY
+from src.modules.mini_game_alarm import ALARM
 import glob
 import time
 import cv2
@@ -33,16 +34,29 @@ ELITE_TEMPLATE = cv2.imread('assets/elite_template.jpg', 0)
 # distinctive pieces ("anchors") cropped from its reference image (assets/pop-up-N.png)
 # and saved as assets/pop_up_anchors/<prefix>_*.png. Any one anchor matching counts,
 # so the real pop-up can differ from the reference. Drop in more crops to add anchors.
-# A solver starts automatically for each one (see src/modules/mini_games.py).
+# Where a solver exists it starts automatically (see src/modules/mini_games.py).
+#
+# Every pop-up rings the same alarm (the shape game's siren, looping) and shows a
+# flashing button beside the game until it is clicked or the solver clears the
+# game (mini_games.CLEARED_RESULTS); see src/modules/mini_game_alarm.py.
+# WHITE_TEXT: the pop-up is drawn see-through over the game, so only its white
+# text is matched (the picture behind it changes).
+#   (name, prefix, white text, threshold)
 POP_UPS = (
-    ('Lie Detector (fading shape) mini-game', 'pop-up-1'),
-    ('Violetta mini-game', 'pop-up-2'),
+    ('Lie Detector (fading shape) mini-game', 'pop-up-1', False, 0.83),  # gameplay <= 0.77
+    ('Violetta mini-game', 'pop-up-2', False, 0.83),
+    ('Question/answer ("Answer within 10 seconds")', 'pop-up-3', True, 0.70),
+    # pop-up-3: pop-up >= 0.80, gameplay <= 0.55 in testing
 )
-POP_UP_THRESHOLD = 0.83         # Normal gameplay scored <= 0.77 in testing
+# A pop-up is ignored while any of its rivals is also on screen. Since 2026-11-19 the
+# Violetta notice ("Lie Detector Guide", blue box) shows the same "W" guide NPC as the
+# shape game's, so pop-up-1_npc matched it (0.97) and the shape solver ran instead.
+# pop-up-2_v2_portrait catches that new notice. pop-up-2_mushroom was retired then
+# (assets/pop_up_anchors/retired): it set off 5 of 5 false alarms on Explorer/viewer
+# windows showing the sprites; pop-up-2_bubble now covers the variant only it caught.
+POP_UP_OVERRIDES = {'pop-up-1': ('pop-up-2',)}
 POP_UP_SCALES = tuple(round(0.8 + 0.05 * i, 2) for i in range(10))     # 0.80 - 1.25
 POP_UP_CHECK_SECONDS = 0.5      # How often to scan the screen for pop-ups
-POP_UP_SOUND = 'assets/alerts/siren.mp3'
-POP_UP_REPEAT_SECONDS = 5       # Replay the sound while the pop-up stays on screen
 
 
 class Notifier:
@@ -56,22 +70,14 @@ class Notifier:
         self.room_change_threshold = 0.9
         self.rune_alert_delay = 270         # 4.5 minutes
         self.pop_ups = []
-        for name, prefix in POP_UPS:
+        for name, prefix, white_text, threshold in POP_UPS:
             anchors = [cv2.imread(path) for path in
                        sorted(glob.glob(f'assets/pop_up_anchors/{prefix}_*.png'))]
-            detector = PopUpAnchorDetector(anchors, threshold=POP_UP_THRESHOLD,
-                                           scales=POP_UP_SCALES, downscale=0.5)
+            detector = PopUpAnchorDetector(anchors, threshold=threshold, scales=POP_UP_SCALES,
+                                           downscale=0.5, white_text=white_text)
             self.pop_ups.append((name, prefix, detector, RisingEdgeAlert(release_frames=2)))
         self.mini_games = MiniGameRunner()
         self.pop_up_thread = threading.Thread(target=self._pop_up_main, daemon=True)
-        self.pop_up_last_sound = 0
-        self._sound = None
-        try:
-            import pygame
-            pygame.mixer.init()
-            self._sound = pygame.mixer.Sound(POP_UP_SOUND)
-        except Exception as error:
-            print(f'\n[!] Could not load pop-up alert sound, falling back to beep: {error}')
 
     def start(self):
         """Starts this Notifier's thread."""
@@ -92,7 +98,9 @@ class Notifier:
 
                 # Check for unexpected black screen
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                if np.count_nonzero(gray < 15) / height / width > self.room_change_threshold:
+                expected = time.monotonic() < getattr(config, 'map_transition_until', 0.0)
+                if not expected and \
+                        np.count_nonzero(gray < 15) / height / width > self.room_change_threshold:
                     self._alert()
 
                 # Check for elite warning
@@ -143,34 +151,47 @@ class Notifier:
 
     def _check_pop_ups(self, frame):
         """
-        When pop-up-1.png or pop-up-2.png appears on screen: plays an alert and
-        starts that mini-game's solver.
+        When one of POP_UPS appears on screen: rings the alarm (siren + flashing
+        button until the user clicks it) and starts its mini-game solver, if any.
         """
 
-        any_visible = False
+        seen = {prefix: detector.detect(frame) for _, prefix, detector, _ in self.pop_ups}
+        for prefix, rivals in POP_UP_OVERRIDES.items():
+            if seen.get(prefix) and any(seen.get(rival) for rival in rivals):
+                seen[prefix] = False
         for name, prefix, detector, edge in self.pop_ups:
-            visible = detector.detect(frame)
-            any_visible = any_visible or visible
-            if edge.update(visible):
+            if edge.update(seen[prefix]):
                 print(f'\n[!] {name} pop-up detected! Check the game window.')
-                self._play_pop_up_sound()
-                self.mini_games.trigger(prefix)
-        if any_visible and time.time() - self.pop_up_last_sound >= POP_UP_REPEAT_SECONDS:
-            self._play_pop_up_sound()
-        elif not any(edge.active for _, _, _, edge in self.pop_ups) and self._sound is not None:
-            self._sound.stop()      # Pop-ups are gone; silence the siren
+                self._save_pop_up(prefix, frame, detector)
+                ALARM.ring(name)
+                started = self.mini_games.trigger(prefix)
+                if not started and not (prefix in GAMES and AUTO_SOLVE.get(prefix, False)):
+                    # No solver for this one: it is still a mini-game that came up
+                    print(f'[~] {TALLY.record(name.split(" (")[0], "left to you")}')
 
-    def _play_pop_up_sound(self):
-        self.pop_up_last_sound = time.time()
+    POP_UP_RECORD_DIR = 'logs/pop_ups'      # the frame behind each alert; None to disable
+    POP_UP_RECORD_KEEP = 200
+
+    def _save_pop_up(self, prefix, frame, detector):
+        """Keeps the screenshot that set an alert off (was it a real pop-up?)."""
+        directory = self.POP_UP_RECORD_DIR
+        if not directory:
+            return
         try:
-            if self._sound is not None:
-                if self._sound.get_num_channels() == 0:     # Don't overlap itself
-                    self._sound.play()
-                return
-            import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            import os
+            os.makedirs(directory, exist_ok=True)
+            try:
+                score = f'-score{detector.best_score(frame):.2f}'
+            except Exception:
+                score = ''
+            name = f'{prefix}-{time.strftime("%Y%m%d-%H%M%S")}{score}.jpg'
+            cv2.imwrite(os.path.join(directory, name), frame[:, :, :3],
+                        [cv2.IMWRITE_JPEG_QUALITY, 88])
+            files = sorted(f for f in os.listdir(directory) if f.endswith('.jpg'))
+            for old in files[:-self.POP_UP_RECORD_KEEP]:
+                os.remove(os.path.join(directory, old))
         except Exception as error:
-            print(f'\n[!] Could not play the pop-up alert sound: {error}')
+            print(f'\n[!] Could not save the pop-up screenshot: {error}')
 
     def _alert(self):
         """

@@ -84,23 +84,44 @@ def _to_gray(image):
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
+def white_text_mask(image):
+    """
+    Bright, colourless pixels (white text) as a soft 0-255 mask; everything else
+    black. For pop-ups drawn see-through over the game, where the picture behind
+    the text changes but the text itself stays the same.
+    """
+    if image.ndim == 2:
+        mask = cv2.inRange(image, 200, 255)
+    else:
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, 200), (180, 50, 255))
+    return cv2.GaussianBlur(mask, (3, 3), 0)    # tolerates a little scaling and blur
+
+
 class PopUpAnchorDetector:
     """
     Detects a pop-up from small, distinctive pieces ("anchors") cropped from a
     reference screenshot, e.g. its title text or NPC portrait. The pop-up counts
     as visible when ANY anchor matches, so it still triggers if the real pop-up's
     body text, size, or surroundings differ from the reference.
+
+    WHITE_TEXT: match only the white text in the anchors and the screen (for a
+    see-through pop-up whose background is whatever the game shows behind it).
     """
 
     SCALES = (0.8, 0.9, 1.0, 1.1, 1.25)
     MATCH_THRESHOLD = 0.8
 
-    def __init__(self, anchors, threshold=None, scales=None, downscale=1.0):
+    def __init__(self, anchors, threshold=None, scales=None, downscale=1.0, white_text=False):
+        self.white_text = white_text
+        self._prepare = white_text_mask if white_text else _to_gray
         self.anchors = []
         for anchor in anchors:
             if anchor is None or anchor.size == 0:
                 raise ValueError("Pop-up anchor image is empty.")
-            self.anchors.append(_to_gray(anchor))
+            self.anchors.append(self._prepare(anchor))
         if not self.anchors:
             raise ValueError("At least one pop-up anchor is required.")
         self.threshold = self.MATCH_THRESHOLD if threshold is None else threshold
@@ -118,7 +139,9 @@ class PopUpAnchorDetector:
 
     def best_score(self, frame):
         """Returns the highest anchor match score in FRAME (0 to 1)."""
-        gray = _to_gray(frame)
+        if frame is None or frame.ndim not in (2, 3):
+            raise ValueError("Image must be a grayscale, BGR, or BGRA array.")
+        gray = self._prepare(frame)
         if self.downscale != 1:
             gray = cv2.resize(gray, None, fx=self.downscale, fy=self.downscale,
                               interpolation=cv2.INTER_AREA)

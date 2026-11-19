@@ -808,18 +808,26 @@ class PigBeachTests(unittest.TestCase):
                 tracker._mob_templates = [(pig, -25)]
                 tracker.config.update({'Enemy count': 1, 'Enemy alignments': '-25',
                                        'Enemy speeds': 'jumper', 'Enabled': False})
+                pig_badge = np.full((20, 50), 120, np.uint8)
+                cv2.imwrite(paths['PLAYER_TEMPLATE_PATH'], pig_badge)
+                tracker._player_template = pig_badge
                 tracker.save_profile('pig-beach')
-                tracker.load_profile('snail-spore')
+                tracker.load_profile('snail-spore', preserve_player_badge=True)
 
                 self.assertEqual(tracker.config['Enemy count'], 2)
                 self.assertEqual(tracker.config['Enemy speeds'], 'normal,normal')
                 self.assertFalse(tracker.config['Enabled'])     # loading never enables
                 self.assertEqual(len(tracker._mob_templates), 2)
                 self.assertTrue(np.array_equal(tracker._mob_templates[0][0], snail))
+                self.assertTrue(np.array_equal(tracker._player_template, pig_badge))
                 # what was active before loading was kept in the autosave
                 self.assertIn('_autosave', MobTracker.profile_names())
+                current_badge = np.full((20, 50), 150, np.uint8)
+                cv2.imwrite(paths['PLAYER_TEMPLATE_PATH'], current_badge)
+                tracker._player_template = current_badge
                 tracker.load_profile('pig-beach')
                 self.assertEqual(tracker.enemy_speed_profiles(), ['jumper'])
+                self.assertTrue(np.array_equal(tracker._player_template, pig_badge))
                 with self.assertRaises(ValueError):
                     tracker.save_profile('../escape')
 

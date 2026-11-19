@@ -137,7 +137,14 @@ class RecalibrationTests(unittest.TestCase):
         return Capture._needs_recalibration(fake, old_rect, area, by_hand, marker_lost)
 
     def test_same_window_and_marker_seen(self):
-        self.assertFalse(self.needs((0, 0, 1024, 768), outline=((1, 1), (9, 9))))
+        self.assertFalse(self.needs((0, 0, 1024, 768), outline=((6, 72), (217, 155))))
+        self.assertFalse(self.needs((0, 0, 1024, 768), outline=None))   # outline hidden
+        self.assertFalse(self.needs((0, 0, 1024, 768), outline=((7, 72), (219, 156))))  # 1-2 px
+
+    def test_minimap_shrank_with_the_marker_still_inside(self):
+        # run-20261118-170231: kept a 262x120 area while the map was 211x83
+        self.assertTrue(self.needs((0, 0, 1024, 768), area=((14, 103), (276, 223)),
+                                   outline=((14, 103), (225, 186))))
 
     def test_the_window_moved_or_is_new(self):
         self.assertTrue(self.needs((40, 30, 1064, 798)))

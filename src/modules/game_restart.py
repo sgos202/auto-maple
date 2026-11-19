@@ -44,7 +44,7 @@ import numpy as np
 AUTO_RESTART = True                 # False: only warn, never restart the game
 # Restart when Windows has less than this much memory (commit) left and the
 # game is what filled it. At ~6 GB an hour this leaves about half an hour.
-RESTART_FREE_MB = 3500
+RESTART_FREE_MB = 15000             # restart the game when free commit drops under ~15 GB
 RESTART_MIN_HANDLES = 60000         # the client's leak shows as this many open handles
 RESTART_MIN_GAP_SECONDS = 1800      # never twice within this long
 GAME_TITLE = 'MapleStory'
@@ -199,12 +199,10 @@ class Screen:
 
     def click(self, point, double=False):
         x, y = int(self.origin[0] + point[0]), int(self.origin[1] + point[1])
+        from src.common import vkeys
         for _ in range(2 if double else 1):
-            self.user32.SetCursorPos(x, y)
-            time.sleep(0.05 + 0.05 * random.random())
-            self.user32.mouse_event(0x0002, 0, 0, 0, 0)     # left down
-            time.sleep(0.05 + 0.04 * random.random())
-            self.user32.mouse_event(0x0004, 0, 0, 0, 0)     # left up
+            vkeys.click((x, y), settle=(0.05, 0.10), hold=(0.05, 0.09),
+                        allow_paused=True)
             time.sleep(0.08 + 0.04 * random.random())
 
     def park(self):
