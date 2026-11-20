@@ -1679,3 +1679,35 @@ class UnsureLostTrackTests(unittest.TestCase):
 
     def test_followed_track_unchanged(self):
         self.assertTrue(vs._usable_unsure_track({0: 3}, self.report(False, seen=0.6, error=30), 0))
+
+
+class WindowMovedTests(unittest.TestCase):
+    """20261120-123844: the window was dragged a few px after round 3 and the
+    bot stopped as if it had closed, with a round left."""
+
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        self.frame = np.full((400, 600, 3), 60, np.uint8)
+        self.strip = rng.integers(0, 255, (24, 200, 3), dtype=np.uint8)
+        self.calibration = vs.Calibration(1.0, (100, 50), 1.0)
+
+    def place(self, x, y):
+        frame = self.frame.copy()
+        frame[y:y + 24, x:x + 200] = self.strip
+        return frame
+
+    def reference(self):
+        return cv2.cvtColor(self.strip, cv2.COLOR_BGR2GRAY)
+
+    def test_a_dragged_window_is_found(self):
+        frame = self.place(97, 56)
+        self.assertEqual(vs._find_moved_window(frame, self.calibration, self.reference()),
+                         (-3, 6))
+
+    def test_a_closed_window_is_not(self):
+        self.assertIsNone(vs._find_moved_window(self.frame, self.calibration,
+                                                self.reference()))
+
+    def test_unmoved_is_not_a_move(self):
+        frame = self.place(100, 50)
+        self.assertIsNone(vs._find_moved_window(frame, self.calibration, self.reference()))

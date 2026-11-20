@@ -6,15 +6,17 @@ from tkinter import messagebox, ttk
 import cv2
 from PIL import Image, ImageTk
 from src.common import config
+from src.gui import theme
+from src.gui.interfaces import Tab
 
 
-class MobTracker(ttk.Frame):
-    SAMPLE_PREVIEW_SIZE = (72, 72)
+class MobTracker(Tab):
+    """The Combat page: sampled-enemy auto-attack and how the patrol moves."""
+
+    SAMPLE_PREVIEW_SIZE = (56, 56)
 
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, padding=(0, 3), **kwargs)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(2, weight=1)
+        super().__init__(parent, 'Combat', **kwargs)
         self.tracker = config.capture.mob_tracker
         current = self.tracker.settings()
         self.sample_vars = []
@@ -23,165 +25,126 @@ class MobTracker(ttk.Frame):
 
         self.enabled = tk.BooleanVar(value=current['Enabled'])
         self.distance = tk.StringVar(value=str(current['Range']))
-
-        ttk.Checkbutton(
-            self,
-            text='Enable auto-attack (works without a routine)',
-            variable=self.enabled,
-            command=self._apply_settings
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        ttk.Label(self, text='Insert (3s); start on patrol level').grid(
-            row=0, column=2, columnspan=2, sticky=tk.E
-        )
-
-        ttk.Button(
-            self,
-            text='Calibrate player + enemies',
-            command=config.gui.select_mob_templates
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0), padx=(0, 4))
-        ttk.Button(
-            self,
-            text='Add enemy sample',
-            command=config.gui.add_mob_template
-        ).grid(row=1, column=2, columnspan=2, sticky=tk.EW, pady=(4, 0))
-
-        ttk.Label(self, text='Search range').grid(
-            row=2, column=0, sticky=tk.W, pady=(5, 0)
-        )
-        self.distance_box = tk.Spinbox(
-            self,
-            from_=20,
-            to=600,
-            increment=10,
-            width=5,
-            textvariable=self.distance,
-            command=self._apply_settings
-        )
-        self.distance_box.grid(row=2, column=1, sticky=tk.W, pady=(5, 0))
-        self.distance_box.bind('<FocusOut>', self._apply_settings)
-        self.distance_box.bind('<Return>', self._apply_settings)
-        ttk.Label(self, text='px   Hold attack').grid(
-            row=2, column=2, sticky=tk.W, pady=(5, 0)
-        )
-        # Off for a character without a group skill: piles are then fought
-        # one enemy at a time and the Pig Beach gather (built on Q) is skipped
         self.group_skill = tk.BooleanVar(value=self.tracker.group_skill_enabled())
-        ttk.Checkbutton(
-            self,
-            text='Use group skill (Q) on piles',
-            variable=self.group_skill,
-            command=lambda: self.tracker.set_group_skill(self.group_skill.get())
-        ).grid(row=2, column=3, sticky=tk.W, pady=(5, 0))
-
-        # Ranged pull for a magician (Magic Missile): hit an enemy from afar,
-        # let it come, finish it with the melee swing. Off by default and
-        # saved with the profile (a profile without it loads it as off).
         missile = self.tracker.missile_settings()
         self.missile = tk.BooleanVar(value=missile['enabled'])
         self.missile_key = tk.StringVar(value=missile['key'])
         self.missile_range = tk.StringVar(value=str(missile['range']))
-        ttk.Checkbutton(
-            self,
-            text='Magic missile pulls enemies (magician)',
-            variable=self.missile,
-            command=self._apply_missile
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
-        missile_row = ttk.Frame(self)
-        missile_row.grid(row=6, column=2, columnspan=2, sticky=tk.W, pady=(5, 0))
-        ttk.Label(missile_row, text='Key').pack(side=tk.LEFT)
-        key_box = ttk.Entry(missile_row, textvariable=self.missile_key, width=6)
-        key_box.pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Label(missile_row, text='Max range').pack(side=tk.LEFT)
+        self.sweep = tk.BooleanVar(value=self.tracker.sweep_patrol_enabled())
+        self.edge_loot = tk.BooleanVar(value=self.tracker.edge_loot_enabled())
+        self.idle_variety = tk.BooleanVar(value=self.tracker.idle_variety_enabled())
+        self.profile_name = tk.StringVar()
+        self.status = tk.StringVar()
+
+        # ---- auto-attack ----
+        body = theme.section(self, 'Auto-attack', hint='works without a routine')
+        ttk.Checkbutton(body, text='Attack sampled enemies', variable=self.enabled,
+                        command=self._apply_settings).grid(row=0, column=0, columnspan=2,
+                                                           sticky=tk.W)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        buttons.columnconfigure((0, 1), weight=1, uniform='b')
+        ttk.Button(buttons, text='Calibrate player + enemies',
+                   command=config.gui.select_mob_templates).grid(row=0, column=0,
+                                                                 sticky=tk.EW, padx=(0, 3))
+        ttk.Button(buttons, text='Add enemy sample',
+                   command=config.gui.add_mob_template).grid(row=0, column=1, sticky=tk.EW,
+                                                             padx=(3, 0))
+        ttk.Label(body, text='Search range (px)').grid(row=2, column=0, sticky=tk.W,
+                                                       pady=(8, 0))
+        self.distance_box = ttk.Spinbox(body, from_=20, to=600, increment=10, width=7,
+                                        textvariable=self.distance,
+                                        command=self._apply_settings)
+        self.distance_box.grid(row=2, column=1, sticky=tk.E, pady=(8, 0))
+        self.distance_box.bind('<FocusOut>', self._apply_settings)
+        self.distance_box.bind('<Return>', self._apply_settings)
+        # Off for a character without a group skill: piles are then fought
+        # one enemy at a time and the Pig Beach gather (built on Q) is skipped
+        ttk.Checkbutton(body, text='Use group skill (Q) on piles', variable=self.group_skill,
+                        command=lambda: self.tracker.set_group_skill(self.group_skill.get())
+                        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        theme.status_label(body, self.status).grid(row=4, column=0, columnspan=2,
+                                                   sticky=tk.EW, pady=(6, 0))
+
+        # ---- magic missile ----
+        # Ranged pull for a magician (Magic Missile): hit an enemy from afar,
+        # let it come, finish it with the melee swing. Off by default and
+        # saved with the profile (a profile without it loads it as off).
+        body = theme.section(self, 'Ranged pull', hint='magician')
+        ttk.Checkbutton(body, text='Magic missile pulls enemies', variable=self.missile,
+                        command=self._apply_missile).grid(row=0, column=0, columnspan=2,
+                                                          sticky=tk.W)
+        row = ttk.Frame(body)
+        row.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        ttk.Label(row, text='Key').pack(side=tk.LEFT)
+        key_box = ttk.Entry(row, textvariable=self.missile_key, width=6)
+        key_box.pack(side=tk.LEFT, padx=(6, 14))
+        ttk.Label(row, text='Max range (px)').pack(side=tk.LEFT)
         low, high = self.tracker.MISSILE_RANGE_LIMITS
-        range_box = tk.Spinbox(
-            missile_row, from_=low, to=high, increment=10, width=5,
-            textvariable=self.missile_range, command=self._apply_missile
-        )
-        range_box.pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(missile_row, text='px').pack(side=tk.LEFT)
+        range_box = ttk.Spinbox(row, from_=low, to=high, increment=10, width=6,
+                                textvariable=self.missile_range, command=self._apply_missile)
+        range_box.pack(side=tk.RIGHT)
         for box in (key_box, range_box):
             box.bind('<FocusOut>', self._apply_missile)
             box.bind('<Return>', self._apply_missile)
 
+        # ---- patrol ----
+        body = theme.section(self, 'Patrol')
         # Long maps with ramps (Perion Street Corner): sweep end to end, count
         # enemies up or down a ramp, hold the attack and step in between swings
-        self.sweep = tk.BooleanVar(value=self.tracker.sweep_patrol_enabled())
-        ttk.Checkbutton(
-            self,
-            text='Sweep the map end to end (long map with ramps; hold attack and step in)',
-            variable=self.sweep,
-            command=lambda: self.tracker.set_sweep_patrol(self.sweep.get())
-        ).grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
-
+        ttk.Checkbutton(body, text='Sweep the map end to end (long maps with ramps)',
+                        variable=self.sweep,
+                        command=lambda: self.tracker.set_sweep_patrol(self.sweep.get())
+                        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
         # Drops on scenery at the map's ends (hay bales), and a less regular
         # patrol when nothing is in sight. Both saved with the profile.
-        self.edge_loot = tk.BooleanVar(value=self.tracker.edge_loot_enabled())
-        ttk.Checkbutton(
-            self,
-            text='Jump for loot where the patrol turns (drops on hay bales at the ends)',
-            variable=self.edge_loot,
-            command=lambda: self.tracker.set_edge_loot(self.edge_loot.get())
-        ).grid(row=8, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
-        self.idle_variety = tk.BooleanVar(value=self.tracker.idle_variety_enabled())
-        ttk.Checkbutton(
-            self,
-            text='Vary idle patrol (random hops, short stops, different turn points)',
-            variable=self.idle_variety,
-            command=lambda: self.tracker.set_idle_variety(self.idle_variety.get())
-        ).grid(row=9, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(body, text='Jump for loot where the patrol turns',
+                        variable=self.edge_loot,
+                        command=lambda: self.tracker.set_edge_loot(self.edge_loot.get())
+                        ).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        ttk.Checkbutton(body, text='Vary idle patrol (hops, short stops, turn points)',
+                        variable=self.idle_variety,
+                        command=lambda: self.tracker.set_idle_variety(self.idle_variety.get())
+                        ).grid(row=2, column=0, columnspan=2, sticky=tk.W)
 
+        # ---- profile ----
         # Profiles: one saved set of samples + settings per map (snails, pigs, ...)
-        ttk.Label(self, text='Profile').grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
-        self.profile_name = tk.StringVar()
-        self.profile_box = ttk.Combobox(
-            self, textvariable=self.profile_name, width=18,
-            values=self.tracker.profile_names()
-        )
-        self.profile_box.grid(row=5, column=1, sticky=tk.EW, pady=(5, 0), padx=(0, 4))
-        ttk.Button(self, text='Save profile', command=self._save_profile).grid(
-            row=5, column=2, sticky=tk.EW, pady=(5, 0), padx=(0, 4)
-        )
-        ttk.Button(self, text='Load profile', command=self._load_profile).grid(
-            row=5, column=3, sticky=tk.EW, pady=(5, 0)
-        )
+        body = theme.section(self, 'Profile', hint='samples + settings per map')
+        self.profile_box = ttk.Combobox(body, textvariable=self.profile_name,
+                                        values=self.tracker.profile_names())
+        self.profile_box.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        buttons.columnconfigure((0, 1), weight=1, uniform='b')
+        ttk.Button(buttons, text='Save', command=self._save_profile).grid(
+            row=0, column=0, sticky=tk.EW, padx=(0, 3))
+        ttk.Button(buttons, text='Load', command=self._load_profile).grid(
+            row=0, column=1, sticky=tk.EW, padx=(3, 0))
 
-        self.status = tk.StringVar()
-        ttk.Label(self, textvariable=self.status, wraplength=700).grid(
-            row=3, column=0, columnspan=4, sticky=tk.EW, pady=(5, 0)
-        )
-
-        self.samples = ttk.LabelFrame(
-            self, text='Enemy samples — focused samples are preferred', padding=5
-        )
-        self.samples.grid(
-            row=4, column=0, columnspan=4, sticky=tk.EW, pady=(5, 0)
-        )
-        self.samples.grid_columnconfigure(0, weight=1)
-        self.sample_canvas = tk.Canvas(
-            self.samples, height=112, highlightthickness=0
-        )
+        # ---- samples ----
+        body = theme.section(self, 'Enemy samples', hint='focused ones are preferred')
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0)
+        self.sample_canvas = tk.Canvas(body, height=118, highlightthickness=0,
+                                       bg=theme.SURFACE)
+        self.sample_canvas.keep_enabled = True
         self.sample_canvas.grid(row=0, column=0, sticky=tk.EW)
-        self.sample_scroll = ttk.Scrollbar(
-            self.samples, orient=tk.HORIZONTAL, command=self.sample_canvas.xview
-        )
+        self.sample_scroll = ttk.Scrollbar(body, orient=tk.HORIZONTAL,
+                                           command=self.sample_canvas.xview)
         self.sample_scroll.grid(row=1, column=0, sticky=tk.EW)
         self.sample_canvas.configure(xscrollcommand=self.sample_scroll.set)
         self.sample_container = ttk.Frame(self.sample_canvas)
         self.sample_window = self.sample_canvas.create_window(
-            (0, 0), window=self.sample_container, anchor=tk.NW
-        )
+            (0, 0), window=self.sample_container, anchor=tk.NW)
         self.sample_container.bind(
             '<Configure>',
             lambda _event: self.sample_canvas.configure(
-                scrollregion=self.sample_canvas.bbox('all')
-            )
-        )
+                scrollregion=self.sample_canvas.bbox('all')))
         self.sample_canvas.bind(
             '<Configure>',
             lambda event: self.sample_canvas.itemconfigure(
-                self.sample_window, height=event.height
-            )
-        )
+                self.sample_window, height=event.height))
+        ttk.Frame(self, height=theme.PAD).pack()
         self.refresh_samples()
         self._refresh_status()
 
@@ -203,8 +166,8 @@ class MobTracker(ttk.Frame):
             return
 
         for index, sample in enumerate(samples):
-            card = ttk.Frame(self.sample_container, padding=(4, 2))
-            card.pack(side=tk.LEFT, padx=3)
+            card = tk.Frame(self.sample_container, bg=theme.RAISED, padx=4, pady=3)
+            card.pack(side=tk.LEFT, padx=(0, 6))
 
             if sample.ndim == 2:
                 preview = Image.fromarray(sample)
@@ -219,12 +182,12 @@ class MobTracker(ttk.Frame):
             preview.thumbnail(self.SAMPLE_PREVIEW_SIZE, Image.Resampling.LANCZOS)
             image = ImageTk.PhotoImage(preview)
             self.sample_images.append(image)
-            ttk.Label(card, image=image).pack()
+            tk.Label(card, image=image, bg=theme.RAISED).pack()
 
             variable = tk.BooleanVar(value=index in focused)
             self.sample_vars.append(variable)
-            ttk.Checkbutton(
-                card,
+            tk.Checkbutton(
+                card, bg=theme.RAISED, activebackground=theme.RAISED,
                 text=f'Focus {index + 1}',
                 variable=variable,
                 command=self._apply_focus_samples
@@ -332,13 +295,5 @@ class MobTracker(ttk.Frame):
             self.distance.set(str(current['Range']))
 
     def _refresh_status(self):
-        if config.enabled:
-            mode = (
-                'Standalone patrol running'
-                if len(config.routine) == 0
-                else 'Routine running'
-            )
-        else:
-            mode = 'Paused'
-        self.status.set(f'{mode} | {self.tracker.status()}')
+        self.status.set(self.tracker.status())
         self.after(300, self._refresh_status)

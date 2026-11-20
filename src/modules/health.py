@@ -373,6 +373,11 @@ class ManaPotionMonitor(Configurable):
         with self._lock:
             return self._current_percent
 
+    def last_region(self):
+        """The MP bar (x1, y1, x2, y2) last found, or None."""
+        with self._lock:
+            return self._region
+
     def last_action(self):
         with self._lock:
             return self._last_action
@@ -408,3 +413,147 @@ class ManaPotionMonitor(Configurable):
         if use_potion:
             print(f'\n[~] MP is {percent:.0f}%; sending MP potion key {key.upper()}.')
             press(key, 1, allow_paused=True)
+
+
+# ---- EXP: the yellow-green bar right of the MP bar on the bottom HUD ----
+# Measured on violetta-20261120-100529-uncalibrated/00.jpg: fill BGR ~(0, 229,
+# 212), hue 32-37; the bar read 106 of 114 px = 93 % where the game said 92.95 %.
+
+EXP_HUE = (24, 42)
+EXP_TRACK_GAP = 4
+
+
+def _exp_mask(bar):
+    hsv = cv2.cvtColor(np.ascontiguousarray(bar[:, :, :3]), cv2.COLOR_BGR2HSV)
+    return ((hsv[:, :, 0] >= EXP_HUE[0]) & (hsv[:, :, 0] <= EXP_HUE[1])
+            & (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 120))
+
+
+def find_exp_bar_region(frame, hp_region, mp_region=None):
+    """
+    The EXP bar (x1, y1, x2, y2): on the HP bar's row, right of the MP bar (or
+    of where it would be), a yellow-green fill followed by its grey track.
+    None when the HP bar is unknown or no fill shows (EXP near 0 %).
+    """
+    if frame is None or frame.ndim != 3 or hp_region is None:
+        return None
+    hx1, hy1, hx2, hy2 = hp_region
+    bar_width = hx2 - hx1
+    width = frame.shape[1]
+    start = mp_region[2] if mp_region is not None else hx2 + bar_width
+    stop = min(width, start + round(bar_width * 1.8))
+    band = frame[hy1:hy2, start:stop]
+    if band.size == 0:
+        return None
+    columns = np.count_nonzero(_exp_mask(band), axis=0) >= max(1, round(band.shape[0] * 0.25))
+    filled = np.flatnonzero(columns)
+    if len(filled) == 0:
+        return None
+    x1 = start + int(filled[0])
+    x2 = x1
+    while x2 + 1 - start < len(columns) and columns[x2 + 1 - start]:
+        x2 += 1
+    row = frame[(hy1 + hy2) // 2, :, :3].astype(np.int16)
+    # The empty track is light grey (~185); the HUD behind the bar is dark
+    # grey (~55) and must not count, or the bar reads too long (88 % for 93 %)
+    neutral = ((row.max(axis=1) - row.min(axis=1) <= 12)
+               & (row.mean(axis=1) >= 120) & (row.mean(axis=1) < 250))
+    gap, end = 0, x2
+    while end + 1 < width and gap <= EXP_TRACK_GAP:
+        end += 1
+        if neutral[end]:
+            x2, gap = end, 0
+        else:
+            gap += 1
+    if not HP_BAR_MIN_WIDTH <= x2 - x1 + 1 <= HP_BAR_MAX_WIDTH * 1.3:
+        return None
+    return x1, hy1, x2 + 1, hy2
+
+
+def estimate_exp_percent(frame, region):
+    """EXP from the yellow-green fill of REGION (0 when only the track shows)."""
+    if frame is None or region is None or frame.ndim != 3:
+        return None
+    x1, y1, x2, y2 = region
+    if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0] or x2 - x1 < 10:
+        return None
+    bar = frame[y1:y2, x1:x2]
+    columns = np.count_nonzero(_exp_mask(bar), axis=0) >= max(1, round(bar.shape[0] * 0.25))
+    filled = np.flatnonzero(columns)
+    if len(filled) == 0:
+        row = bar[bar.shape[0] // 2].astype(np.int16)
+        grey = ((row.max(axis=1) - row.min(axis=1) <= 12) & (row.mean(axis=1) >= 50)).mean()
+        return 0.0 if grey >= 0.8 else None
+    if filled[0] > max(2, round(bar.shape[1] * 0.1)):
+        return None
+    return min(100.0, (filled[-1] + 1) * 100.0 / bar.shape[1])
+
+
+class ExpMonitor:
+    """Reads the EXP bar and works out the gain per hour and time to level."""
+
+    REGION_MEMORY_SECONDS = 30.0    # just after a level-up the bar shows no fill
+    RATE_WINDOW_SECONDS = 600.0     # gain per hour over the last 10 minutes
+    RATE_MIN_SECONDS = 60.0         # ...once at least a minute is known
+    LEVEL_UP_DROP = 40.0            # % fall that means a new level, not a bad read
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._percent = None
+        self._region = None
+        self._region_time = float('-inf')
+        self._history = []          # (time, cumulative %): level-ups add 100
+        self._levels = 0
+        self._last_raw = None
+
+    def current_percent(self):
+        with self._lock:
+            return self._percent
+
+    def rate_per_hour(self):
+        """EXP % gained per hour, or None until enough is known."""
+        with self._lock:
+            return self._rate_locked()
+
+    def _rate_locked(self):
+        if len(self._history) < 2:
+            return None
+        (t0, p0), (t1, p1) = self._history[0], self._history[-1]
+        if t1 - t0 < self.RATE_MIN_SECONDS:
+            return None
+        return max(0.0, (p1 - p0) * 3600.0 / (t1 - t0))
+
+    def seconds_to_level(self):
+        with self._lock:
+            rate = self._rate_locked()
+            if not rate or self._percent is None:
+                return None
+            return (100.0 - self._percent) * 3600.0 / rate
+
+    def levels_gained(self):
+        with self._lock:
+            return self._levels
+
+    def process_frame(self, frame, hp_region, mp_region=None):
+        now = time.monotonic()
+        region = find_exp_bar_region(frame, hp_region, mp_region)
+        if region is not None:
+            self._region, self._region_time = region, now
+        elif (self._region is not None and hp_region is not None
+              and now - self._region_time <= self.REGION_MEMORY_SECONDS):
+            region = self._region
+        percent = estimate_exp_percent(frame, region)
+        with self._lock:
+            self._percent = percent
+            if percent is None:
+                return
+            if self._last_raw is not None and self._last_raw - percent >= self.LEVEL_UP_DROP:
+                self._levels += 1
+            self._last_raw = percent
+            total = self._levels * 100.0 + percent
+            self._history.append((now, total))
+            cutoff = now - self.RATE_WINDOW_SECONDS
+            while len(self._history) > 2 and self._history[0][0] < cutoff:
+                self._history.pop(0)
+            if len(self._history) > 4000:
+                del self._history[1:-2000]

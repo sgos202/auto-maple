@@ -7,7 +7,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 from src.common import config, settings
-from src.gui import Menu, View, Edit, Settings, Log
+from src.gui import Menu, View, Edit, Settings, Log, theme
+from src.gui.view.header import Bars, Radar
+from src.gui.view.minimap import Minimap
 
 
 class GUI:
@@ -18,37 +20,70 @@ class GUI:
         'TCheckbutton', 'TCombobox', 'TEntry', 'TMenubutton', 'TRadiobutton',
         'TScale', 'TSpinbox', 'Text'
     }
-    RESOLUTIONS = {
-        'DEFAULT': '800x800',
-        'Edit': '1400x800'
-    }
+    SIZE = (400, 880)
+    MIN_SIZE = (370, 640)
+    EDITOR_SIZE = '1400x800'
+    APP_ID = 'AutoMaple.App'
+    # Menu entries that stay usable while running (see _sync_control_states)
+    KEEP_MENU_LABELS = {'Routine editor', 'Always on top', 'Open logs folder'}
 
     def __init__(self):
         config.gui = self
+        _set_app_id(GUI.APP_ID)     # own taskbar button and icon, not Python's
 
         self.root = tk.Tk()
         self.root.title('Auto Maple')
-        icon = tk.PhotoImage(file='assets/icon.png')
-        self.root.iconphoto(False, icon)
-        self.root.geometry(GUI.RESOLUTIONS['DEFAULT'])
-        self.root.resizable(False, False)
+        self._set_icons()
+        width, height = GUI.SIZE
+        self.root.geometry(f'{width}x{height}')
+        self.root.minsize(*GUI.MIN_SIZE)
+        theme.apply(self.root)
 
         # Initialize GUI variables
         self.routine_var = tk.StringVar()
+        self.on_top = tk.BooleanVar(value=False)
 
-        # Build the GUI
-        self.menu = Menu(self.root)
-        self.root.config(menu=self.menu)
+        # The old menu bar lives behind the footer's ⋯ button now
+        self.menu = Menu(self.root, tearoff=0)
+        self.menu.add_separator()
+        self.menu.add_command(label='Routine editor', command=self.open_editor)
+        self.menu.add_checkbutton(label='Always on top', variable=self.on_top,
+                                  command=self._apply_on_top)
+        self.menu.add_command(label='Open logs folder', command=_open_logs_folder)
 
-        self.navigation = ttk.Notebook(self.root)
+        # Footer first so it keeps its place when the window is short
+        self._build_footer()
 
-        self.view = View(self.navigation)
-        self.edit = Edit(self.navigation)
-        self.settings = Settings(self.navigation)
-        self.log = Log(self.navigation)
+        # Header: HP / MP / EXP on the left, the enemy radar top right
+        header = tk.Frame(self.root, bg=theme.BG)
+        header.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 8))
+        header.columnconfigure(0, weight=1)
+        self.bars = Bars(header)
+        self.bars.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 10))
+        self.radar = Radar(header)
+        self.radar.grid(row=0, column=1, sticky=tk.NE)
 
-        self.navigation.pack(expand=True, fill='both')
-        self.navigation.bind('<<NotebookTabChanged>>', self._resize_window)
+        self.minimap = Minimap(self.root)
+        self.minimap.pack(fill=tk.X, padx=theme.PAD)
+
+        # Pages under a flat tab strip
+        card = tk.Frame(self.root, bg=theme.SURFACE)
+        self.host = theme.PageHost(card)
+        self.navigation = theme.NavBar(self.root, self.host)
+        self.navigation.pack(fill=tk.X, padx=theme.PAD, pady=(8, 0))
+        card.pack(fill=tk.BOTH, expand=True, padx=theme.PAD)
+        self.host.pack(fill=tk.BOTH, expand=True)
+
+        self.view = View(self.host, self.minimap)
+        self.settings = Settings(self.host)
+        self.log = Log(self.host)
+        self.navigation.build()
+
+        # The routine editor is wide: its own window, hidden until opened
+        self.editor_window = theme.WindowHost(self.root, 'Auto Maple · Routine editor',
+                                              GUI.EDITOR_SIZE)
+        self.edit = Edit(self.editor_window)
+
         self._control_states = {}
         self._menu_states = []
         self._controls_locked = None
@@ -56,8 +91,24 @@ class GUI:
         self._alarm_button = None
         self._alarm_flash = False
         self._alarm_click_through = None
+        self._toggle_thread = None
+        self._run_started = None
         self.root.after(100, self._sync_control_states)
+        self.root.after(200, self._refresh_footer)
         self.root.focus()
+
+    def _set_icons(self):
+        """The orange mushroom on the title bar, taskbar and alt-tab."""
+        try:
+            self.root.iconbitmap(default='assets/icon_app.ico')
+        except tk.TclError:
+            pass
+        try:
+            self._icons = [tk.PhotoImage(file='assets/icon_64.png'),
+                           tk.PhotoImage(file='assets/icon.png')]
+            self.root.iconphoto(True, *self._icons)
+        except tk.TclError:
+            pass
 
     def set_routine(self, arr):
         self.routine_var.set(arr)
@@ -76,18 +127,123 @@ class GUI:
         self.edit.routine.commands.update_display()
         self.edit.editor.reset()
 
-    def _resize_window(self, e):
-        """Callback to resize entire Tkinter window every time a new Page is selected."""
+    def open_editor(self):
+        self.editor_window.open()
 
-        nav = e.widget
-        curr_id = nav.select()
-        nav.nametowidget(curr_id).focus()      # Focus the current Tab
-        page = nav.tab(curr_id, 'text')
-        if self.root.state() != 'zoomed':
-            if page in GUI.RESOLUTIONS:
-                self.root.geometry(GUI.RESOLUTIONS[page])
-            else:
-                self.root.geometry(GUI.RESOLUTIONS['DEFAULT'])
+    def _apply_on_top(self):
+        self.root.attributes('-topmost', bool(self.on_top.get()))
+
+    #################################
+    #   Footer: start / stop        #
+    #################################
+    def _build_footer(self):
+        footer = tk.Frame(self.root, bg=theme.BG)
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=theme.PAD, pady=theme.PAD)
+        self.start_button = tk.Button(
+            footer, text='▶  START', width=9, bg=theme.ACCENT, fg=theme.ACCENT_TEXT,
+            activebackground=theme.ACCENT_HOVER, activeforeground=theme.ACCENT_TEXT,
+            font=theme.FONT_BOLD, relief=tk.FLAT, bd=0, pady=7, cursor='hand2',
+            command=self._start_stop)
+        self.start_button.keep_enabled = True
+        self.start_button.pack(side=tk.LEFT)
+        self.more_button = tk.Button(
+            footer, text='•••', width=4, bg=theme.RAISED, fg=theme.TEXT,
+            activebackground=theme.HOVER, activeforeground=theme.TEXT,
+            font=theme.FONT_BOLD, relief=tk.FLAT, bd=0, pady=7, cursor='hand2',
+            command=self._show_more)
+        self.more_button.keep_enabled = True
+        self.more_button.pack(side=tk.RIGHT)
+        state = tk.Frame(footer, bg=theme.RAISED)
+        state.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6)
+        self.state_dot = tk.Label(state, text='●', bg=theme.RAISED, fg=theme.FAINT,
+                                  font=theme.FONT)
+        self.state_dot.pack(side=tk.LEFT, padx=(8, 4))
+        self.state_text = tk.Label(state, text='Stopped', bg=theme.RAISED, fg=theme.TEXT,
+                                   font=theme.FONT_BOLD, anchor=tk.W)
+        self.state_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.state_hint = tk.Label(state, text='', bg=theme.RAISED, fg=theme.MUTED,
+                                   font=theme.FONT_SMALL)
+        self.state_hint.pack(side=tk.RIGHT, padx=8)
+
+    def _show_more(self):
+        x = self.more_button.winfo_rootx()
+        y = self.more_button.winfo_rooty()
+        try:
+            self.menu.tk_popup(x, y - self.menu.winfo_reqheight())
+        finally:
+            self.menu.grab_release()
+
+    def _start_stop(self):
+        """Same as pressing the start/stop hotkey (runs off the Tk thread: a
+        start counts down 3 s for the game window to be focused)."""
+        if self._toggle_thread is not None and self._toggle_thread.is_alive():
+            return
+
+        def run():
+            from src.modules import game_restart, mini_games
+            from src.modules.listener import Listener
+            print('\n[~] Start/stop pressed in the app.')
+            if game_restart.handle_start_stop():        # mid-restart: call it off
+                return
+            if mini_games.handle_start_stop():          # mid-game: resume after, or not
+                return
+            Listener.toggle_enabled()
+
+        self._toggle_thread = threading.Thread(target=run, daemon=True)
+        self._toggle_thread.start()
+
+    def _refresh_footer(self):
+        try:
+            self._update_footer()
+        except Exception as error:
+            now = time.monotonic()
+            if now - getattr(self, '_footer_error_at', 0) > 30:
+                self._footer_error_at = now
+                print(f'\n[!] Footer update failed: {error}')
+        self.root.after(250, self._refresh_footer)
+
+    def _update_footer(self):
+        from src.modules import game_restart, mini_games
+        now = time.monotonic()
+        if config.enabled and self._run_started is None:
+            self._run_started = now
+        elif not config.enabled:
+            self._run_started = None
+        runner = mini_games.ACTIVE_RUNNER
+        hotkey = ''
+        try:
+            hotkey = config.listener.config['Start/stop'].upper()
+        except Exception:
+            pass
+        starting = (not config.enabled and self._toggle_thread is not None
+                    and self._toggle_thread.is_alive())
+        if game_restart.RUNNER.busy:
+            dot, text, hint = theme.WARN, 'Restarting the game…', ''
+        elif runner is not None and runner.busy:
+            dot, text, hint = '#c9a7ff', 'Solving a mini-game…', ''
+        elif starting:
+            dot, text, hint = theme.WARN, 'Starting… focus MapleStory', ''
+        elif config.enabled:
+            elapsed = int(now - self._run_started)
+            hours, rest = divmod(elapsed, 3600)
+            mode = 'routine' if len(config.routine) else 'patrol'
+            dot = theme.OK
+            text = f'Running · {mode}'
+            hint = f'{hours}:{rest // 60:02d}:{rest % 60:02d}'
+        else:
+            dot, text, hint = theme.FAINT, 'Stopped', hotkey
+        self.state_dot.configure(fg=dot)
+        self.state_text.configure(text=text)
+        self.state_hint.configure(text=hint)
+        if config.enabled:
+            self.start_button.configure(text='■  STOP', bg=theme.DANGER, fg='#ffffff',
+                                        activebackground='#f06a6e',
+                                        activeforeground='#ffffff')
+        else:
+            self.start_button.configure(text='▶  START', bg=theme.ACCENT,
+                                        fg=theme.ACCENT_TEXT,
+                                        activebackground=theme.ACCENT_HOVER,
+                                        activeforeground=theme.ACCENT_TEXT)
 
     # Loaded on start-up so there is no setup step after a restart. Load
     # another one from File > Load Command Book whenever needed.
@@ -146,9 +302,13 @@ class GUI:
 
                 self._menu_states = []
                 for index in range(self.menu.index('end') + 1):
+                    if self.menu.type(index) == 'separator':
+                        self._menu_states.append(None)
+                        continue
                     state = self.menu.entrycget(index, 'state')
                     self._menu_states.append(state)
-                    self.menu.entryconfigure(index, state=tk.DISABLED)
+                    if self.menu.entrycget(index, 'label') not in GUI.KEEP_MENU_LABELS:
+                        self.menu.entryconfigure(index, state=tk.DISABLED)
             else:
                 for widget, state in self._control_states.items():
                     if widget.winfo_exists():
@@ -156,7 +316,8 @@ class GUI:
                 self._control_states.clear()
 
                 for index, state in enumerate(self._menu_states):
-                    self.menu.entryconfigure(index, state=state)
+                    if state is not None:
+                        self.menu.entryconfigure(index, state=state)
                 self._menu_states = []
 
             self._controls_locked = locked
@@ -731,6 +892,25 @@ class GUI:
 if __name__ == '__main__':
     gui = GUI()
     gui.start()
+
+
+def _set_app_id(app_id):
+    """Windows groups taskbar buttons by app id; without one the window is
+    shown as python.exe, with Python's icon."""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
+def _open_logs_folder():
+    path = os.path.abspath('logs')
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.startfile(path)
+    except OSError as error:
+        print(f'\n[!] Could not open {path}: {error}')
 
 
 def _game_rect(title):

@@ -11,6 +11,7 @@ import numpy as np
 from src.common import config, utils
 from ctypes import wintypes
 from src.modules.health import HealthPotionMonitor, ManaPotionMonitor
+from src.modules.health import ExpMonitor
 from src.modules.loot_tracker import LootTracker
 from src.modules.mob_tracker import MobTracker
 from src.modules.minimap_finder import find_minimap_area
@@ -116,6 +117,7 @@ class Capture:
         self.frame = None
         self.health = HealthPotionMonitor()
         self.mana = ManaPotionMonitor()
+        self.exp = ExpMonitor()
         self.mob_tracker = MobTracker()
         self.loot_tracker = LootTracker()
         self.minimap = {}
@@ -218,12 +220,24 @@ class Capture:
 
     ERROR_REPORT_SECONDS = 30       # one console line per failing part this often
 
+    def _count_frame(self):
+        """Frames processed per second (smoothed), shown over the app's minimap."""
+        now = time.monotonic()
+        last = self.__dict__.get('_frame_time')
+        self._frame_time = now
+        if last is None or now - last <= 0:
+            return
+        rate = 1.0 / (now - last)
+        self.fps = rate if not getattr(self, 'fps', 0) else self.fps * 0.9 + rate * 0.1
+
     def _process_modules(self, frame):
         """The per-frame detectors, each guarded: one failing (e.g. out of
         memory) skips only its own work for this frame."""
         steps = (
             ('health', lambda: self.health.process_frame(frame)),
             ('mana', lambda: self.mana.process_frame(frame, self.health.last_region())),
+            ('exp', lambda: self.exp.process_frame(
+                frame, self.health.last_region(), self.mana.last_region())),
             ('mob tracker', lambda: self.mob_tracker.process_frame(frame, config.enabled)),
             ('loot tracker', lambda: self.loot_tracker.process_frame(frame, config.enabled)),
         )
@@ -440,6 +454,7 @@ class Capture:
                     self.frame = self.screenshot()
                     if self.frame is None:
                         continue
+                    self._count_frame()
                     self._process_modules(self.frame)
 
                     # Crop the frame to only show the minimap

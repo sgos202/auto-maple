@@ -141,10 +141,11 @@ class KeyBindings(LabelFrame):
         self.displays[action] = display_var
 
         row = Frame(self.contents, highlightthickness=0)
-        row.pack(expand=True, fill='x')
+        row.pack(expand=True, fill='x', pady=1)
+        row.columnconfigure((0, 1), weight=1, uniform='key')
 
         label = tk.Entry(row)
-        label.grid(row=0, column=0, sticky=tk.EW)
+        label.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
         label.insert(0, action)
         label.config(state=tk.DISABLED)
 
@@ -182,9 +183,10 @@ class KeyBindings(LabelFrame):
     def create_disabled_entry(self):
         row = Frame(self.contents, highlightthickness=0)
         row.pack(expand=True, fill='x')
+        row.columnconfigure((0, 1), weight=1, uniform='key')
 
         label = tk.Entry(row)
-        label.grid(row=0, column=0, sticky=tk.EW)
+        label.grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
         label.config(state=tk.DISABLED)
 
         entry = tk.Entry(row)

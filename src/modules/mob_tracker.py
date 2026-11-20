@@ -802,6 +802,28 @@ class MobTracker(Configurable):
                 return []
             return list(seen[1])
 
+    def radar(self):
+        """
+        The last scan for the app's radar: {'size': (w, h) of the game frame,
+        'player': (x, y), 'enemies': [(x, y, health ratio or None)], 'target':
+        (x, y) of the locked enemy or None}, in frame pixels. None when the
+        last scan is older than a second or found no player.
+        """
+        with self._lock:
+            seen = self.__dict__.get('_radar')
+            if seen is None or time.monotonic() - seen[0] > 1.0:
+                return None
+            _, width, height, player, enemies = seen
+            locked = self.__dict__.get('_locked_target')
+            target = None
+            if locked is not None:
+                try:
+                    target = (int(locked[1]), int(locked[2]))
+                except (TypeError, ValueError, IndexError):
+                    target = None
+            return {'size': (width, height), 'player': player,
+                    'enemies': list(enemies), 'target': target}
+
     def waiting(self):
         """True while a jumping target is mid-hop above the swing: stand and wait."""
         with self._lock:
@@ -2565,6 +2587,8 @@ class MobTracker(Configurable):
 
         if not candidates:
             with self._lock:
+                self._radar = (time.monotonic(), frame.shape[1], frame.shape[0],
+                               (player_x, player_y), [])
                 self._enemy_offsets = (time.monotonic(), [])
                 self._attack_direction = None
                 self._attack_is_group = False
@@ -2628,6 +2652,11 @@ class MobTracker(Configurable):
             if not (self._is_weak(item)
                     and self._portal_light(frame, item[1], ground_y) >= self.PORTAL_LIGHT)
         ]
+        with self._lock:    # every enemy seen, for the app's radar
+            self._radar = (time.monotonic(), frame.shape[1], frame.shape[0],
+                           (player_x, player_y),
+                           [(int(item[1]), int(item[2]), item[3])
+                            for item in positioned_candidates])
         if sweep:
             # Up or down a ramp from the character: on its level all the same
             positioned_candidates = [

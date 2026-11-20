@@ -314,6 +314,8 @@ class Bot(Configurable):
         watchdog.register('bot', self.THREAD_STALL_SECONDS)
         while True:
             watchdog.heartbeat('bot')
+            if config.enabled:
+                self._service_buffs()       # the Buffs page's timed buffs
             if config.enabled and len(config.routine) == 0:
                 self._guarded_tick()
             elif config.enabled and len(config.routine) > 0:
@@ -362,6 +364,23 @@ class Bot(Configurable):
                 self._forget_patrol_home()
                 self._forget_walls()
                 time.sleep(0.01)
+
+    def _service_buffs(self):
+        """Casts the buffs set up on the Buffs page that are due, between ticks
+        (never during a held attack or a jump), letting go of keys first."""
+        try:
+            from src.modules.buffs import BUFFS
+
+            def let_go():
+                self._set_auto_attack_movement(None)
+                self._release_mob_attack()
+
+            BUFFS.service(let_go)
+        except Exception as error:
+            now = time.monotonic()
+            if now - self.__dict__.get('_buff_error_at', 0) > 30:
+                self._buff_error_at = now
+                print(f'\n[!] Buffs failed: {error}')
 
     THREAD_STALL_SECONDS = 30       # watchdog: a tick this long is a hang (stacks dumped)
     TICK_ERROR_LIMIT = 5            # this many errors within a minute: pause

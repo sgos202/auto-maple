@@ -33,6 +33,10 @@ class File(MenuBarItem):
         self.entryconfig('New Routine', state=tk.NORMAL)
         self.entryconfig('Save Routine', state=tk.NORMAL)
         self.entryconfig('Load Routine', state=tk.NORMAL)
+        try:    # the same actions as buttons on the Routine page
+            config.gui.view.routine.enable_routine_buttons()
+        except AttributeError:
+            pass
 
     @staticmethod
     @utils.run_if_disabled('\n[!] Cannot create a new routine while Auto Maple is enabled')

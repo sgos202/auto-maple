@@ -1886,6 +1886,35 @@ def _window_still_open(frame, calibration, reference):
         >= WINDOW_GONE_SCORE
 
 
+# The player can drag the mini-game window (20261120-123844: it moved down a
+# few px after round 3, the title strip matched 0.01 at its old place, and
+# the bot stopped with a round left as if the window had closed).
+WINDOW_MOVE_SEARCH = 80         # px around the old place to look for the title strip
+WINDOW_MOVED_SCORE = 0.8
+
+
+def _find_moved_window(frame, calibration, reference, search=WINDOW_MOVE_SEARCH):
+    """Where the title strip went: (dx, dy) in frame px from its old place, or
+    None when it is nowhere near (the window really closed)."""
+    if reference is None or frame is None:
+        return None
+    x0, y0 = (int(v) for v in calibration.to_frame((0, 0)))
+    h, w = reference.shape[:2]
+    left, top = max(0, x0 - search), max(0, y0 - search)
+    right = min(frame.shape[1], x0 + w + search)
+    bottom = min(frame.shape[0], y0 + h + search)
+    area = frame[top:bottom, left:right, :3]
+    if area.shape[0] < h or area.shape[1] < w:
+        return None
+    scores = cv2.matchTemplate(cv2.cvtColor(area, cv2.COLOR_BGR2GRAY), reference,
+                               cv2.TM_CCOEFF_NORMED)
+    _, best, _, (bx, by) = cv2.minMaxLoc(scores)
+    if best < WINDOW_MOVED_SCORE:
+        return None
+    dx, dy = left + bx - x0, top + by - y0
+    return (dx, dy) if (dx, dy) != (0, 0) else None
+
+
 def play_live(title='MapleStory', select=False, timeout=120.0, overlay=True, record_dir=None):
     """
     Watches the game window and, with SELECT, clicks each answer once the
@@ -2014,7 +2043,17 @@ def play_live(title='MapleStory', select=False, timeout=120.0, overlay=True, rec
                     if _window_still_open(frame, solver.calibration, title_reference):
                         window_misses = 0
                     else:
-                        window_misses += 1
+                        moved = _find_moved_window(frame, solver.calibration, title_reference)
+                        if moved is not None:
+                            # Dragged, not closed: follow it (tracking, clicks
+                            # and the overlay are all placed from the origin)
+                            ox, oy = solver.calibration.origin
+                            solver.calibration.origin = (ox + moved[0], oy + moved[1])
+                            window_misses = 0
+                            print(f'[VIOLETTA] {tag()}The game window moved by '
+                                  f'({moved[0]:+d}, {moved[1]:+d}) px; following it.')
+                        else:
+                            window_misses += 1
                     if window_misses >= WINDOW_GONE_CHECKS and solver.state in ('calibrate', 'reveal'):
                         # Found only as a game was ending (no round played):
                         # start over and wait for the next game
